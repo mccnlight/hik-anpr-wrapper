@@ -1,0 +1,12 @@
+/__pycache__/
+/.venv/
+*.jpg
+*/__pycache__/
+/datasets/
+/models/
+/ppocr/
+*/test/
+/hik_raws/
+.env
+/.venv311/
+/snapshots/
