@@ -28,8 +28,8 @@ UPSTREAM_URL = os.getenv(
     "UPSTREAM_URL", "https://snowops-anpr-service.onrender.com/api/v1/anpr/events"
 )
 PLATE_CAMERA_ID = os.getenv("PLATE_CAMERA_ID", "camera-001")
-MERGE_WINDOW_SECONDS = int(os.getenv("MERGE_WINDOW_SECONDS", "30"))
-MERGE_TTL_SECONDS = int(os.getenv("MERGE_TTL_SECONDS", "60"))
+MERGE_WINDOW_SECONDS = int(os.getenv("MERGE_WINDOW_SECONDS", "120"))
+MERGE_TTL_SECONDS = int(os.getenv("MERGE_TTL_SECONDS", "180"))
 ENABLE_SNOW_WORKER = os.getenv("ENABLE_SNOW_WORKER", "false").lower() == "true"
 
 merger = init_merger(

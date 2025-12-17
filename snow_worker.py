@@ -36,6 +36,7 @@ STATIONARY_TIMEOUT_SECONDS = float(os.getenv("SNOW_STATIONARY_TIMEOUT_SECONDS", 
 R2L_CONFIRM_THRESHOLD = int(os.getenv("SNOW_R2L_CONFIRM_THRESHOLD", "5"))  # После N подтверждений R→L игнорируем машину
 STATIONARY_HARD_TIMEOUT_SECONDS = float(os.getenv("SNOW_STATIONARY_HARD_TIMEOUT_SECONDS", "60.0"))  # После 1 минуты стоянки игнорируем машину
 LEAVE_RESET_THRESHOLD = int(os.getenv("SNOW_LEAVE_RESET_THRESHOLD", "12"))  # Сколько кадров подряд без детекта считать, что машина ушла
+SNOW_ALLOW_R2L_EVENT = os.getenv("SNOW_ALLOW_R2L_EVENT", "false").lower() == "true"  # Разрешать событие даже при движении R→L
 
 SHOW_WINDOW = os.getenv("SNOW_SHOW_WINDOW", "false").lower() == "true"
 
@@ -407,8 +408,8 @@ def _snow_loop(upstream_url: str):
                 should_add_event = (
                     in_zone
                     and not event_sent_for_current_truck
-                    and (moving_right or (is_first_detection and not stationary_block))  # Не шлём сразу после сброса стоячей
-                    and not current_frame_r_to_l
+                    and (moving_right or SNOW_ALLOW_R2L_EVENT or (is_first_detection and not stationary_block))  # Не шлём сразу после сброса стоячей
+                    and (SNOW_ALLOW_R2L_EVENT or not current_frame_r_to_l)
                     and not ignore_current_truck
                 )
                 

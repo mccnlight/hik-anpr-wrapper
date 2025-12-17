@@ -14,10 +14,15 @@ from google import genai
 from PIL import Image
 
 
+# Локальный часовой пояс (по умолчанию Astana/UTC+6)
+LOCAL_TZ = timezone(
+    timedelta(hours=int(os.getenv("LOCAL_TZ_OFFSET_HOURS", "6")))
+)
+
 # Максимальный возраст события для матчинга (секунды)
 # События старше этого возраста не будут матчиться с ANPR событиями
 # Это предотвращает матчинг старых событий от стоячих машин с новыми ANPR событиями
-MAX_EVENT_AGE_SECONDS = float(os.getenv("MERGE_MAX_EVENT_AGE_SECONDS", "15.0"))
+MAX_EVENT_AGE_SECONDS = float(os.getenv("MERGE_MAX_EVENT_AGE_SECONDS", "60.0"))
 # Сколько секунд максимум ждать прихода парного события снега, если ANPR пришел раньше.
 # По умолчанию равно MERGE_WINDOW_SECONDS (если задан), иначе 20.
 WAIT_FOR_SNOW_SECONDS = float(
@@ -26,6 +31,9 @@ WAIT_FOR_SNOW_SECONDS = float(
         os.getenv("MERGE_WINDOW_SECONDS", "20")
     )
 )
+
+# Требовать ли обязательный матч со снегом, иначе не отправлять событие
+REQUIRE_SNOW_MATCH = os.getenv("MERGE_REQUIRE_SNOW_MATCH", "false").lower() == "true"
 
 
 def _parse_iso_dt(value: str | None) -> Optional[datetime]:
@@ -51,14 +59,19 @@ def _parse_iso_dt(value: str | None) -> Optional[datetime]:
             cleaned = cleaned[:-1] + "+00:00"
         # Парсим ISO формат (поддерживает +06:00, -05:00 и т.д.)
         dt = datetime.fromisoformat(cleaned)
-        # Если нет timezone, добавляем UTC
+        # Если нет timezone, добавляем локальный TZ
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        # Конвертируем в UTC
-        return dt.astimezone(timezone.utc)
+            dt = dt.replace(tzinfo=LOCAL_TZ)
+        # Конвертируем в локальный TZ
+        return dt.astimezone(LOCAL_TZ)
     except Exception as e:
         print(f"[MERGER] ERROR parsing datetime '{value}': {e}")
         return None
+
+
+def _now() -> datetime:
+    """Возвращает текущее время в локальном часовом поясе (по умолчанию UTC+6 Astana)."""
+    return datetime.now(tz=LOCAL_TZ)
 
 
 @dataclass
@@ -135,8 +148,8 @@ class EventMerger:
 
     def add_snow_event(self, payload: Dict[str, Any], photo_bytes: bytes | None) -> None:
         event_time_str = str(payload.get("event_time", ""))
-        event_time = _parse_iso_dt(event_time_str) or datetime.now(tz=timezone.utc)
-        now = datetime.now(tz=timezone.utc)
+        event_time = _parse_iso_dt(event_time_str) or _now()
+        now = _now()
         
         # Логируем разницу между временем события и текущим временем для диагностики
         time_diff = (now - event_time).total_seconds()
@@ -187,7 +200,7 @@ class EventMerger:
         best_idx = None
         best_delta = None
         
-        now = datetime.now(tz=timezone.utc)
+        now = _now()
         
         print(f"[MERGER] DEBUG: searching ANPR match for snow_time={snow_time.isoformat()}, anpr_queue_size={len(self._anpr_events)}, window={self.window.total_seconds()}s")
         
@@ -252,7 +265,7 @@ class EventMerger:
             return None
         
         # Логируем все события в очереди для диагностики
-        now = datetime.now(tz=timezone.utc)
+        now = _now()
         anpr_time_diff_from_now = (anpr_time - now).total_seconds()
         print(f"[MERGER] DEBUG: current time={now.isoformat()}, anpr_time={anpr_time.isoformat()}, "
               f"anpr_time_diff_from_now={anpr_time_diff_from_now:.1f}s")
@@ -347,7 +360,7 @@ class EventMerger:
         interval = 2.0  # Проверка каждые 2 секунды
         while not self._stop_cleanup.is_set():
             time.sleep(interval)
-            now = datetime.now(tz=timezone.utc)
+            now = _now()
             with self._lock:
                 self._cleanup(now)
                 # Логируем состояние очередей для диагностики
@@ -531,7 +544,7 @@ class EventMerger:
         and send a single multipart request upstream.
         Поддерживает оба порядка: ANPR->snow и snow->ANPR.
         """
-        now = datetime.now(tz=timezone.utc)
+        now = _now()
         anpr_time_str = str(anpr_event.get("event_time", ""))
         anpr_time = _parse_iso_dt(anpr_time_str) or now
         
@@ -559,16 +572,16 @@ class EventMerger:
         # Если снег еще не пришел, и разрешено подождать — ждём до заданного таймаута
         # Проверяем каждые 0.2 секунды (как было), но также логируем состояние очереди
         if snow_event is None and WAIT_FOR_SNOW_SECONDS > 0:
-            wait_deadline = datetime.now(tz=timezone.utc) + timedelta(seconds=min(WAIT_FOR_SNOW_SECONDS, self.window.total_seconds()))
-            wait_duration = (wait_deadline - datetime.now(tz=timezone.utc)).total_seconds()
+            wait_deadline = _now() + timedelta(seconds=min(WAIT_FOR_SNOW_SECONDS, self.window.total_seconds()))
+            wait_duration = (wait_deadline - _now()).total_seconds()
             print(f"[MERGER] no snow match yet, waiting up to {wait_duration:.1f}s for late snow...")
             check_count = 0
-            while datetime.now(tz=timezone.utc) < wait_deadline:
+            while _now() < wait_deadline:
                 await asyncio.sleep(0.2)
                 check_count += 1
                 with self._lock:
                     # ВАЖНО: очистка должна использовать текущее время, а не anpr_time
-                    current_time = datetime.now(tz=timezone.utc)
+                    current_time = _now()
                     self._cleanup(current_time)
                     queue_size_before = len(self._snow_events)
                     snow_event = self._pop_match(anpr_time)
@@ -646,6 +659,17 @@ class EventMerger:
                     "matched_snow": False,
                 }
             )
+
+        # Если требуется обязательный матч со снегом — не отправляем без matched_snow
+        if REQUIRE_SNOW_MATCH and not combined_event.get("matched_snow"):
+            result = {
+                "sent": False,
+                "status": None,
+                "error": "snow match required but not found",
+                "matched_snow": False,
+            }
+            print("[MERGER] snow match required, skipping upstream send")
+            return result
 
         # Логируем номер и формат времени перед отправкой
         plate_value = combined_event.get("plate", "N/A")
