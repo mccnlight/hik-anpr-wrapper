@@ -40,11 +40,14 @@ SNOW_ALLOW_R2L_EVENT = os.getenv("SNOW_ALLOW_R2L_EVENT", "false").lower() == "tr
 
 SHOW_WINDOW = os.getenv("SNOW_SHOW_WINDOW", "false").lower() == "true"
 
-# Принудительно настраиваем FFMPEG backend: TCP, таймаут ~5с, небольшой буфер
+# Принудительно настраиваем FFMPEG backend: TCP, таймаут ~5с, небольшой буфер, тихий лог FFmpeg
 os.environ.setdefault(
     "OPENCV_FFMPEG_CAPTURE_OPTIONS",
-    "rtsp_transport;tcp|stimeout;5000000|buffer_size;1024000",
+    "rtsp_transport;tcp|stimeout;5000000|buffer_size;1024000|loglevel;quiet",
 )
+
+# Глушим внутренние логи OpenCV/FFmpeg (H.264 decoder и пр.)
+cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_SILENT)
 
 _snow_thread: threading.Thread | None = None
 _stop_event = threading.Event()
@@ -186,7 +189,7 @@ def _snow_loop(upstream_url: str):
     center_x_geom = None
 
     fail_count = 0
-    MAX_FAILS = 50
+    MAX_FAILS = 15
     frame_count = 0
     miss_count = 0          # Счетчик подряд идущих кадров без детекции
     MISS_RESET_THRESHOLD = MISS_RESET_THRESHOLD_ENV  # После скольких пропусков сбрасывать трекинг
@@ -198,9 +201,7 @@ def _snow_loop(upstream_url: str):
         ret, frame = cap.read()
         if not ret or frame is None or frame.size == 0:
             fail_count += 1
-            print(f"[SNOW] read fail {fail_count}")
             if fail_count >= MAX_FAILS:
-                print("[SNOW] reopening stream...")
                 cap.release()
                 time.sleep(2)
                 cap = cv2.VideoCapture(SNOW_VIDEO_SOURCE_URL, cv2.CAP_FFMPEG)
