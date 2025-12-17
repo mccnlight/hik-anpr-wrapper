@@ -149,6 +149,24 @@ def normalize_plate(raw_text: str) -> Optional[str]:
     if not text:
         return None
 
+    # Замена частых OCR-подмен: I/l->1, O/Q->0, B->8, S->5, Z->2
+    ocr_fix_map = str.maketrans({
+        "I": "1",
+        "L": "1",
+        "O": "0",
+        "Q": "0",
+        "B": "8",
+        "S": "5",
+        "Z": "2",
+    })
+    text = text.translate(ocr_fix_map)
+
+    # Хак: если распознали 3 цифры + 2/3 буквы + 3 цифры (ошибка OCR типа "346AB155"),
+    # считаем, что регион = последние 2 цифры, обрезаем лишнее.
+    m = re.match(r'^(\d{3})([A-Z]{2,3})(\d{3})$', text)
+    if m:
+        return f"{m.group(1)}{m.group(2)}{m.group(3)[:2]}"
+
     # 1) Сначала пробуем всю строку целиком
     candidate = _normalize_single(text)
     if candidate is not None:
