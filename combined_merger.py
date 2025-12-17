@@ -22,7 +22,7 @@ LOCAL_TZ = timezone(
 # Максимальный возраст события для матчинга (секунды)
 # События старше этого возраста не будут матчиться с ANPR событиями
 # Это предотвращает матчинг старых событий от стоячих машин с новыми ANPR событиями
-MAX_EVENT_AGE_SECONDS = float(os.getenv("MERGE_MAX_EVENT_AGE_SECONDS", "60.0"))
+MAX_EVENT_AGE_SECONDS = float(os.getenv("MERGE_MAX_EVENT_AGE_SECONDS", "20.0"))
 # Сколько секунд максимум ждать прихода парного события снега, если ANPR пришел раньше.
 # По умолчанию равно MERGE_WINDOW_SECONDS (если задан), иначе 20.
 WAIT_FOR_SNOW_SECONDS = float(

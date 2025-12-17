@@ -149,7 +149,18 @@ def normalize_plate(raw_text: str) -> Optional[str]:
     if not text:
         return None
 
-    # Замена частых OCR-подмен: I/l->1, O/Q->0, B->8, S->5, Z->2
+    # Если строка уже в валидных форматах — не трогаем:
+    #  - 3 цифры + 3 буквы + 2 цифры (192AEB15)
+    #  - 3 цифры + 2 буквы + 2 цифры (192AE15)
+    valid_patterns = (
+        r"^\d{3}[A-Z]{3}\d{2}$",
+        r"^\d{3}[A-Z]{2}\d{2}$",
+    )
+    if any(re.match(p, text) for p in valid_patterns):
+        return text
+
+    # Замены OCR применяем только если номер еще не валиден.
+    # B->8 оставляем по требованию.
     ocr_fix_map = str.maketrans({
         "I": "1",
         "L": "1",
@@ -161,8 +172,12 @@ def normalize_plate(raw_text: str) -> Optional[str]:
     })
     text = text.translate(ocr_fix_map)
 
-    # Хак: если распознали 3 цифры + 2/3 буквы + 3 цифры (ошибка OCR типа "346AB155"),
-    # считаем, что регион = последние 2 цифры, обрезаем лишнее.
+    # После фиксов проверяем снова валидные форматы
+    if any(re.match(p, text) for p in valid_patterns):
+        return text
+
+    # Хак: если 3 цифры + 2/3 буквы + 3 цифры (например, 192AE815),
+    # считаем, что регион максимум 2 цифры — обрезаем до двух.
     m = re.match(r'^(\d{3})([A-Z]{2,3})(\d{3})$', text)
     if m:
         return f"{m.group(1)}{m.group(2)}{m.group(3)[:2]}"
