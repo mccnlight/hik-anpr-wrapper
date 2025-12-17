@@ -39,6 +39,12 @@ LEAVE_RESET_THRESHOLD = int(os.getenv("SNOW_LEAVE_RESET_THRESHOLD", "12"))  # С
 
 SHOW_WINDOW = os.getenv("SNOW_SHOW_WINDOW", "false").lower() == "true"
 
+# Принудительно настраиваем FFMPEG backend: TCP, таймаут ~5с, небольшой буфер
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    "rtsp_transport;tcp|stimeout;5000000|buffer_size;1024000",
+)
+
 _snow_thread: threading.Thread | None = None
 _stop_event = threading.Event()
 
@@ -152,7 +158,7 @@ def _snow_loop(upstream_url: str):
     model = YOLO(SNOW_YOLO_MODEL_PATH)
     merger = init_merger(upstream_url)
 
-    cap = cv2.VideoCapture(SNOW_VIDEO_SOURCE_URL)
+    cap = cv2.VideoCapture(SNOW_VIDEO_SOURCE_URL, cv2.CAP_FFMPEG)
     if not cap.isOpened():
         print(f"[SNOW] cannot open video source: {SNOW_VIDEO_SOURCE_URL}")
         return
@@ -184,6 +190,7 @@ def _snow_loop(upstream_url: str):
     miss_count = 0          # Счетчик подряд идущих кадров без детекции
     MISS_RESET_THRESHOLD = MISS_RESET_THRESHOLD_ENV  # После скольких пропусков сбрасывать трекинг
     leave_count = 0         # Счетчик подряд идущих кадров без детекции для определения, что машина ушла
+    stationary_block = False  # Блокируем мгновенную переотправку после сброса стоячей машины
 
     print("[SNOW] worker started")
     while not _stop_event.is_set():
@@ -195,7 +202,7 @@ def _snow_loop(upstream_url: str):
                 print("[SNOW] reopening stream...")
                 cap.release()
                 time.sleep(2)
-                cap = cv2.VideoCapture(SNOW_VIDEO_SOURCE_URL)
+                cap = cv2.VideoCapture(SNOW_VIDEO_SOURCE_URL, cv2.CAP_FFMPEG)
                 fail_count = 0
             time.sleep(0.05)
             continue
@@ -309,6 +316,9 @@ def _snow_loop(upstream_url: str):
                 last_center_x = center_x_obj
                 last_movement_time = time.time()  # Обновляем время последнего движения
                 r2l_confirmations = 0
+                if stationary_block:
+                    print("[SNOW] movement resumed, clearing stationary block")
+                stationary_block = False
                 if ignore_current_truck:
                     print(f"[SNOW] truck now moving left-to-right, stopping ignore (center_x={center_x_obj:.1f}px)")
                 ignore_current_truck = False
@@ -370,6 +380,7 @@ def _snow_loop(upstream_url: str):
                     last_truck_bbox = None
                     last_truck_was_r_to_l = False
                     r2l_confirmations = 0
+                    stationary_block = True  # блокируем моментальную переотправку
                     should_process_truck = False
                 elif time_since_movement > STATIONARY_TIMEOUT_SECONDS:
                     # Сбрасываем трекинг для стоячей машины, чтобы не логировать постоянно
@@ -381,6 +392,7 @@ def _snow_loop(upstream_url: str):
                     last_truck_bbox = None
                     last_truck_was_r_to_l = False  # Стоячая машина - сбрасываем флаг R→L
                     r2l_confirmations = 0
+                    stationary_block = True  # не шлём событие сразу после сброса стоячей
                     should_process_truck = False  # Пропускаем дальнейшую обработку для этой стоячей машины
             
             # Обрабатываем только если машина не стоит слишком долго
@@ -395,7 +407,7 @@ def _snow_loop(upstream_url: str):
                 should_add_event = (
                     in_zone
                     and not event_sent_for_current_truck
-                    and (moving_right or is_first_detection)  # Упростили: движется L→R ИЛИ первое обнаружение
+                    and (moving_right or (is_first_detection and not stationary_block))  # Не шлём сразу после сброса стоячей
                     and not current_frame_r_to_l
                     and not ignore_current_truck
                 )
@@ -417,8 +429,8 @@ def _snow_loop(upstream_url: str):
                             reasons.append("not in zone")
                         if event_sent_for_current_truck:
                             reasons.append("event already sent")
-                        if not (moving_right or is_first_detection):
-                            reasons.append(f"not moving right and not first detection (moving_right={moving_right}, is_first_detection={is_first_detection})")
+                        if not (moving_right or (is_first_detection and not stationary_block)):
+                            reasons.append(f"not moving right and not first detection or blocked (moving_right={moving_right}, is_first_detection={is_first_detection}, stationary_block={stationary_block})")
                         if current_frame_r_to_l:
                             reasons.append("current frame R→L")
                         if ignore_current_truck:
