@@ -46,8 +46,22 @@ os.environ.setdefault(
     "rtsp_transport;tcp|stimeout;5000000|buffer_size;1024000|loglevel;quiet",
 )
 
-# Глушим внутренние логи OpenCV/FFmpeg (H.264 decoder и пр.)
-cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_SILENT)
+def _silence_opencv_logs() -> None:
+    """Глушим логи OpenCV/FFmpeg; учитываем разные версии OpenCV."""
+    try:
+        # Новый API (OpenCV >=4.5)
+        cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_SILENT)
+        return
+    except Exception:
+        pass
+    try:
+        # Старый API (cv2.setLogLevel)
+        cv2.setLogLevel(cv2.LOG_LEVEL_SILENT)
+    except Exception:
+        # Если нет ни одного API — просто продолжаем
+        pass
+
+_silence_opencv_logs()
 
 _snow_thread: threading.Thread | None = None
 _stop_event = threading.Event()
