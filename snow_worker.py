@@ -295,6 +295,12 @@ def _snow_loop(upstream_url: str):
             # ВАЖНО: не сбрасываем флаг R→L на первом кадре, чтобы не пропускать
             # последовательное движение справа-налево.
             if is_first_detection:
+                # Считаем, что это новое появление в кадре — сбрасываем игнор после R→L
+                if ignore_current_truck:
+                    print("[SNOW] reset ignore flag for new truck (first detection in zone)")
+                ignore_current_truck = False
+                r2l_confirmations = 0
+                last_truck_was_r_to_l = False
                 last_center_x = center_x_obj
                 last_movement_time = time.time()  # Фиксируем время первого обнаружения
                 print(f"[SNOW] first detection in zone (center_x={center_x_obj:.1f}px), saved for direction check")
