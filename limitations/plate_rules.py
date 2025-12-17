@@ -139,8 +139,8 @@ def _normalize_single(text: str) -> Optional[str]:
 
 def normalize_plate(raw_text: str) -> Optional[str]:
     """
-    На вход – сырая строка от OCR (может содержать мусор слева/справа, типа 'PA654WOZ05').
-    На выход – нормализованный номер ('654WOZ05') или None.
+    Возвращаем очищенный от мусора, но без дополнительной нормализации номер.
+    Если после очистки строка пустая — None.
     """
     if not raw_text:
         return None
@@ -149,61 +149,14 @@ def normalize_plate(raw_text: str) -> Optional[str]:
     if not text:
         return None
 
-    # Если строка уже в валидных форматах — не трогаем:
-    #  - 3 цифры + 3 буквы + 2 цифры (192AEB15)
-    #  - 3 цифры + 2 буквы + 2 цифры (192AE15)
-    valid_patterns = (
-        r"^\d{3}[A-Z]{3}\d{2}$",
-        r"^\d{3}[A-Z]{2}\d{2}$",
-    )
-    if any(re.match(p, text) for p in valid_patterns):
-        return text
-
-    # Замены OCR применяем только если номер еще не валиден.
-    # B->8 оставляем по требованию.
-    ocr_fix_map = str.maketrans({
-        "I": "1",
-        "L": "1",
-        "O": "0",
-        "Q": "0",
-        "B": "8",
-        "S": "5",
-        "Z": "2",
-    })
-    text = text.translate(ocr_fix_map)
-
-    # После фиксов проверяем снова валидные форматы
-    if any(re.match(p, text) for p in valid_patterns):
-        return text
-
-    # Хак: если 3 цифры + 2/3 буквы + 3 цифры (например, 192AE815),
-    # считаем, что регион максимум 2 цифры — обрезаем до двух.
-    m = re.match(r'^(\d{3})([A-Z]{2,3})(\d{3})$', text)
+    # Точечный фикс: если в конце «115» или «155» — считаем, что регион должен быть «15».
+    m = re.match(r'^(?P<prefix>\d{2,3}[A-Z]{2,3})(?P<suf>115|155)$', text)
     if m:
-        return f"{m.group(1)}{m.group(2)}{m.group(3)[:2]}"
+        return f"{m.group('prefix')}15"
 
-    # 1) Сначала пробуем всю строку целиком
-    candidate = _normalize_single(text)
-    if candidate is not None:
-        return candidate
+    # Если в конце «19» — тоже считаем, что регион «15».
+    m = re.match(r'^(?P<prefix>\d{2,3}[A-Z]{2,3})19$', text)
+    if m:
+        return f"{m.group('prefix')}15"
 
-    # 2) Если не получилось – ищем номер как ПОДСТРОКУ
-    n = len(text)
-    # Реальные длины казахских номеров – примерно 6..8 символов.
-    MIN_LEN = 6
-    MAX_LEN = 9
-
-    best: Optional[str] = None
-
-    for i in range(n):
-        for j in range(i + MIN_LEN, min(n, i + MAX_LEN) + 1):
-            if j <= i:
-                continue
-            sub = text[i:j]
-            cand = _normalize_single(sub)
-            if cand is not None:
-                # Берём самый "длинный" кандидат (чаще всего он правильный)
-                if best is None or len(cand) > len(best):
-                    best = cand
-
-    return best
+    return text
