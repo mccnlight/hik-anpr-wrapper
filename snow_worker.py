@@ -423,7 +423,7 @@ def _snow_loop(upstream_url: str):
                 should_add_event = (
                     in_zone
                     and not event_sent_for_current_truck
-                    and (moving_right or SNOW_ALLOW_R2L_EVENT or (is_first_detection and not stationary_block))  # Не шлём сразу после сброса стоячей
+                    and (moving_right or SNOW_ALLOW_R2L_EVENT or is_first_detection)  # Убрали проверку stationary_block для первого обнаружения, чтобы события создавались сразу
                     and (SNOW_ALLOW_R2L_EVENT or not current_frame_r_to_l)
                     and not ignore_current_truck
                 )
@@ -445,8 +445,8 @@ def _snow_loop(upstream_url: str):
                             reasons.append("not in zone")
                         if event_sent_for_current_truck:
                             reasons.append("event already sent")
-                        if not (moving_right or (is_first_detection and not stationary_block)):
-                            reasons.append(f"not moving right and not first detection or blocked (moving_right={moving_right}, is_first_detection={is_first_detection}, stationary_block={stationary_block})")
+                        if not (moving_right or SNOW_ALLOW_R2L_EVENT or is_first_detection):
+                            reasons.append(f"not moving right and not first detection (moving_right={moving_right}, is_first_detection={is_first_detection}, allow_r2l={SNOW_ALLOW_R2L_EVENT})")
                         if current_frame_r_to_l:
                             reasons.append("current frame R→L")
                         if ignore_current_truck:
