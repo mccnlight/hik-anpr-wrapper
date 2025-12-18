@@ -429,11 +429,193 @@ class EventMerger:
             print(f"[MERGER] vehicle check failed for plate={plate}: {e}")
             return None
 
+    async def analyze_with_gemini(
+        self,
+        snow_photo: bytes,
+        plate_photo_1: bytes,
+        plate_photo_2: bytes | None,
+    ) -> Dict[str, Any]:
+        """
+        Анализирует 3 фотографии через Gemini:
+        - snow_photo: фото снега (обязательно)
+        - plate_photo_1: первое фото номера (обязательно, обычно detectionPicture)
+        - plate_photo_2: второе фото номера (опционально, featurePicture или licensePlatePicture)
+        
+        Возвращает:
+        {
+            "snow_percentage": 0.0-100.0,
+            "snow_confidence": 0.0-1.0,
+            "plate": "номер или None",
+            "plate_confidence": 0.0-1.0,
+            "error": "описание ошибки если есть"
+        }
+        """
+        if not self._gemini_api_key:
+            print("[GEMINI] ERROR: GEMINI_API_KEY is not set")
+            return {
+                "error": "GEMINI_API_KEY is not set",
+                "snow_percentage": 0.0,
+                "snow_confidence": 0.0,
+                "plate": None,
+                "plate_confidence": 0.0,
+            }
+
+        try:
+            import time as time_module
+            start_time = time_module.time()
+            
+            # Загружаем изображения
+            snow_image = Image.open(io.BytesIO(snow_photo)).convert("RGB")
+            plate_image_1 = Image.open(io.BytesIO(plate_photo_1)).convert("RGB")
+            
+            images = [snow_image, plate_image_1]
+            if plate_photo_2:
+                plate_image_2 = Image.open(io.BytesIO(plate_photo_2)).convert("RGB")
+                images.append(plate_image_2)
+            
+            print(f"[GEMINI] Starting analysis: snow_image={snow_image.size}, "
+                  f"plate_image_1={plate_image_1.size}, "
+                  f"plate_image_2={'present' if plate_photo_2 else 'none'}")
+
+            image3_text = "IMAGE 3: License plate photo 2 - another view of the license plate.\n" if plate_photo_2 else ""
+            prompt = (
+                "You are analyzing truck photos for snow volume and license plate recognition.\n\n"
+                "IMAGE 1: Snow photo - shows the cargo bed of a truck.\n"
+                "IMAGE 2: License plate photo 1 - shows the vehicle's license plate.\n"
+                + image3_text +
+                "\n"
+                "TASKS:\n"
+                "1. Analyze IMAGE 1 (snow photo):\n"
+                "   - Classify ONLY loose/bulk snow inside the OPEN cargo bed.\n"
+                "   - Exclude: painted/clean metal or plastic surfaces, tarps, roof/hood, sides of the truck,\n"
+                "     sun glare, white paint, reflections, frost/ice, road, background, or closed/covered beds.\n"
+                "   - If the bed is not clearly visible or is closed/covered/fully outside the frame, set snow_percentage=0 and snow_confidence=0.0.\n"
+                "   - Snow must look like uneven/loose material with texture; a smooth flat surface (even if white) is NOT snow.\n"
+                "\n"
+                "2. Recognize license plate from IMAGE 2 (and IMAGE 3 if provided):\n"
+                "   - Extract the license plate number from the plate photos.\n"
+                "   - Use the clearest/most readable photo if multiple are provided.\n"
+                "   - Return the plate number in standard format (e.g., '123ABC45' for Kazakhstan plates).\n"
+                "\n"
+                "Return JSON with fields:\n"
+                "- snow_percentage: 0.0-100.0 (how full the bed is with snow, 0-100 scale)\n"
+                "- snow_confidence: 0.0-1.0 (confidence in snow analysis)\n"
+                "- plate: string or null (recognized license plate number, or null if not recognized)\n"
+                "- plate_confidence: 0.0-1.0 (confidence in plate recognition)\n\n"
+                "Example:\n"
+                "{\n"
+                '  "snow_percentage": 42.5,\n'
+                '  "snow_confidence": 0.9,\n'
+                '  "plate": "123ABC45",\n'
+                '  "plate_confidence": 0.85\n'
+                "}\n"
+            )
+            
+            print(f"[GEMINI] Sending request to model={self._gemini_model}, "
+                  f"images_count={len(images)}, prompt_length={len(prompt)} chars")
+
+            client = self._get_gemini_client()
+            response = client.models.generate_content(
+                model=self._gemini_model,
+                contents=images + [prompt],
+            )
+            
+            request_duration = time_module.time() - start_time
+            text = (response.text or "").strip()
+            print(f"[GEMINI] Response received in {request_duration:.2f}s, response_length={len(text)} chars")
+            print(f"[GEMINI] Raw response (first 500 chars): {text[:500]}")
+            
+            if not text:
+                print("[GEMINI] ERROR: Empty response from Gemini")
+                return {
+                    "error": "Empty response from Gemini",
+                    "snow_percentage": 0.0,
+                    "snow_confidence": 0.0,
+                    "plate": None,
+                    "plate_confidence": 0.0,
+                }
+
+            # Очищаем ответ от markdown
+            original_text = text
+            if text.startswith("```"):
+                text = text.strip("`")
+                if text.lower().startswith("json"):
+                    text = text[4:].strip()
+                print(f"[GEMINI] Cleaned response (removed markdown): length={len(text)} chars")
+
+            try:
+                result = json.loads(text)
+                print(f"[GEMINI] Successfully parsed JSON: {result}")
+                
+                # Нормализуем результат
+                snow_percentage = result.get("snow_percentage", 0.0)
+                snow_confidence = result.get("snow_confidence", 0.0)
+                plate = result.get("plate")
+                plate_confidence = result.get("plate_confidence", 0.0)
+                
+                # Нормализуем snow_percentage (может быть 0-1 или 0-100)
+                try:
+                    snow_percentage = float(snow_percentage)
+                    if 0.0 <= snow_percentage <= 1.0:
+                        snow_percentage = snow_percentage * 100.0
+                    snow_percentage = max(0.0, min(100.0, round(snow_percentage, 2)))
+                except (ValueError, TypeError):
+                    snow_percentage = 0.0
+                
+                # Нормализуем confidence значения
+                try:
+                    snow_confidence = float(snow_confidence)
+                    snow_confidence = max(0.0, min(1.0, snow_confidence))
+                except (ValueError, TypeError):
+                    snow_confidence = 0.0
+                
+                try:
+                    plate_confidence = float(plate_confidence)
+                    plate_confidence = max(0.0, min(1.0, plate_confidence))
+                except (ValueError, TypeError):
+                    plate_confidence = 0.0
+                
+                # Нормализуем номер (убираем пробелы, приводим к верхнему регистру)
+                if plate:
+                    plate = str(plate).strip().upper().replace(" ", "")
+                    if not plate or plate == "NULL" or plate == "NONE":
+                        plate = None
+                
+                return {
+                    "snow_percentage": snow_percentage,
+                    "snow_confidence": snow_confidence,
+                    "plate": plate,
+                    "plate_confidence": plate_confidence,
+                }
+            except json.JSONDecodeError as e:
+                print(f"[GEMINI] ERROR: JSON parse failed: {e}")
+                print(f"[GEMINI] Failed to parse text: {text[:500]}")
+                return {
+                    "raw": original_text,
+                    "error": f"JSON parse error: {e}",
+                    "snow_percentage": 0.0,
+                    "snow_confidence": 0.0,
+                    "plate": None,
+                    "plate_confidence": 0.0,
+                }
+        except Exception as e:
+            print(f"[GEMINI] EXCEPTION: {type(e).__name__}: {e}")
+            import traceback
+            print(f"[GEMINI] Traceback: {traceback.format_exc()}")
+            return {
+                "error": str(e),
+                "snow_percentage": 0.0,
+                "snow_confidence": 0.0,
+                "plate": None,
+                "plate_confidence": 0.0,
+            }
+
     def _analyze_snow_gemini(
         self, photo_bytes: bytes, bbox: Optional[Any]
     ) -> Dict[str, Any]:
         """
         Analyze truck bed fill via Gemini using in-memory JPEG bytes.
+        (Старая функция, оставлена для обратной совместимости, но больше не используется)
         """
         if not self._gemini_api_key:
             print("[GEMINI] ERROR: GEMINI_API_KEY is not set")

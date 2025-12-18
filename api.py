@@ -4,6 +4,7 @@ import pathlib
 import datetime
 import json
 import xml.etree.ElementTree as ET
+import uuid
 
 import cv2
 import numpy as np
@@ -20,6 +21,27 @@ app = FastAPI(
     description="HTTP API для распознавания гос-номеров по кадру камеры",
     version="1.0.0",
 )
+
+# Middleware для логирования всех входящих запросов
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start_time = datetime.datetime.now()
+    print(f"\n{'='*80}")
+    print(f"[REQUEST] {start_time.isoformat()} | {request.method} {request.url.path}")
+    print(f"[REQUEST] Client: {request.client.host if request.client else 'unknown'}")
+    print(f"[REQUEST] Headers: {dict(request.headers)}")
+    
+    try:
+        response = await call_next(request)
+        process_time = (datetime.datetime.now() - start_time).total_seconds()
+        print(f"[REQUEST] Response: {response.status_code} | Time: {process_time:.3f}s")
+        print(f"{'='*80}\n")
+        return response
+    except Exception as e:
+        process_time = (datetime.datetime.now() - start_time).total_seconds()
+        print(f"[REQUEST] ERROR: {type(e).__name__}: {e} | Time: {process_time:.3f}s")
+        print(f"{'='*80}\n")
+        raise
 
 # создаём движок один раз, чтобы модели не грузились на каждый запрос
 engine = ANPR()
@@ -251,6 +273,7 @@ async def send_to_upstream(
     detection_bytes: bytes | None,
     feature_bytes: bytes | None,
     license_bytes: bytes | None,
+    snow_bytes: bytes | None = None,
 ) -> Dict[str, Any]:
     """
     Отправка события и фотографий на внешний ANPR-сервис.
@@ -327,6 +350,18 @@ async def send_to_upstream(
                 )
             )
 
+        if snow_bytes:
+            print(
+                f"[UPSTREAM] add photo: field='photos', name='snowSnapshot.jpg', "
+                f"size={len(snow_bytes)}"
+            )
+            files.append(
+                (
+                    "photos",
+                    ("snowSnapshot.jpg", snow_bytes, "image/jpeg"),
+                )
+            )
+
         async with httpx.AsyncClient(timeout=10.0) as client:
             # data + files => multipart/form-data
             resp = await client.post(UPSTREAM_URL, data=data, files=files or None)
@@ -356,12 +391,15 @@ async def hikvision_isapi(request: Request):
     time_str, PARTS_DIR, IMAGES_DIR = get_paths()
     headers = dict(request.headers)
 
+    print("=" * 60)
+    print(f"[HIK] === NEW EVENT RECEIVED at {datetime.datetime.now().isoformat()} ===")
     print("=== HIKVISION REQUEST HEADERS ===")
     for k, v in headers.items():
         print(f"{k}: {v}")
 
     body = await request.body()
     content_type = headers.get("content-type", "")
+    print(f"[HIK] Content-Type: {content_type}, Body size: {len(body)} bytes")
 
     # Информация камеры (из anpr.xml)
     camera_info: Dict[str, Any] = {}
@@ -380,8 +418,11 @@ async def hikvision_isapi(request: Request):
 
     # === ВАРИАНТ 1: multipart/form-data (основной для Hikvision) ===
     if "multipart/form-data" in content_type:
+        print(f"[HIK] Processing multipart/form-data request...")
         form = await request.form()
         found_files = 0
+        form_keys = list(form.keys())
+        print(f"[HIK] Form fields received: {form_keys}")
 
         for key, value in form.items():
             if hasattr(value, "filename"):
@@ -403,8 +444,11 @@ async def hikvision_isapi(request: Request):
                     camera_info = parse_anpr_xml(file_bytes)
                     # Логируем номер от камеры сразу после парсинга
                     camera_plate_detected = camera_info.get("plate")
+                    event_type = camera_info.get("event_type", "unknown")
+                    direction = camera_info.get("direction", "unknown")
+                    print(f"[HIK] 📄 Parsed anpr.xml: plate='{camera_plate_detected}', event_type='{event_type}', direction='{direction}'")
                     if camera_plate_detected:
-                        print(f"[HIK] CAMERA DETECTED PLATE: '{camera_plate_detected}' (from anpr.xml)")
+                        print(f"[HIK] ✅ CAMERA DETECTED PLATE: '{camera_plate_detected}' (from anpr.xml)")
                     continue
 
                 # Картинки держим в памяти, на диск не кладём
@@ -436,6 +480,12 @@ async def hikvision_isapi(request: Request):
             else:
                 # текстовые части (если будут) — просто логируем
                 print(f"[HIK] form field: {key} = {value}")
+
+        # Логируем итоговую информацию о полученных файлах
+        print(f"[HIK] 📦 Files summary: detection={detection_bytes is not None} ({len(detection_bytes) if detection_bytes else 0} bytes), "
+              f"feature={feature_bytes is not None} ({len(feature_bytes) if feature_bytes else 0} bytes), "
+              f"license={license_bytes is not None} ({len(license_bytes) if license_bytes else 0} bytes), "
+              f"anpr_xml={camera_xml_path is not None}")
 
         # === Формируем JSON-событие в простом виде ===
 
@@ -494,7 +544,8 @@ async def hikvision_isapi(request: Request):
         # Если нет валидного номера или уверенности — не отправляем
         if not has_valid_plate or not has_valid_confidence:
             print(
-                f"[HIK] SKIPPING EVENT: plate='{main_plate}' reason='{plate_reason}' "
+                f"[HIK] ⚠️ SKIPPING EVENT: plate='{main_plate}' reason='{plate_reason}' "
+                f"has_valid_plate={has_valid_plate} has_valid_confidence={has_valid_confidence} "
                 f"det_conf={model_det_conf} ocr_conf={model_ocr_conf} camera_conf={camera_conf}"
             )
             log_event = {
@@ -579,6 +630,7 @@ async def hikvision_isapi(request: Request):
         
         if is_exiting:
             # Логируем отфильтрованное событие
+            print(f"[HIK] ⚠️ FILTERED EVENT (exiting vehicle): direction='{direction}', event_type='{event_type}', plate='{event_data.get('plate')}'")
             log_event = {
                 **event_data,
                 "upstream_sent": False,
@@ -593,31 +645,126 @@ async def hikvision_isapi(request: Request):
             print(f"[HIK] Event filtered and logged, not sending to upstream")
             return JSONResponse({"status": "ok"})
         
-        upstream_result = await merger.combine_and_send(
-            anpr_event=event_data,
+        # === НОВАЯ ЛОГИКА: захват снега и анализ через Gemini ===
+        
+        # 1. Генерируем event_id для связывания всех фотографий
+        event_id = str(uuid.uuid4())
+        event_data["event_id"] = event_id
+        print(f"[HIK] Generated event_id: {event_id}")
+        
+        # 2. Захватываем фото снега с задержкой
+        snow_photo_bytes = None
+        if ENABLE_SNOW_WORKER:
+            try:
+                from snow_worker import capture_snow_photo, SNOW_CAPTURE_DELAY_SECONDS
+                print(f"[HIK] Requesting snow photo capture with delay={SNOW_CAPTURE_DELAY_SECONDS}s...")
+                snow_photo_bytes = capture_snow_photo(SNOW_CAPTURE_DELAY_SECONDS)
+                if snow_photo_bytes:
+                    print(f"[HIK] ✅ Snow photo captured, size={len(snow_photo_bytes)} bytes")
+                else:
+                    print(f"[HIK] ⚠️ WARNING: Failed to capture snow photo (buffer may be empty or delay too large)")
+            except Exception as e:
+                print(f"[HIK] ❌ ERROR capturing snow photo: {e}")
+                import traceback
+                print(f"[HIK] Traceback: {traceback.format_exc()}")
+        else:
+            print(f"[HIK] Snow worker disabled, skipping snow photo capture")
+        
+        # 3. Выбираем 2 лучшие фото номеров для Gemini
+        # Приоритет: detection (всегда), затем feature или license (лучшая по размеру)
+        plate_photo_1 = detection_bytes  # Всегда используем detection
+        plate_photo_2 = None
+        
+        if feature_bytes and license_bytes:
+            # Если есть оба, выбираем большее по размеру
+            if len(feature_bytes) >= len(license_bytes):
+                plate_photo_2 = feature_bytes
+            else:
+                plate_photo_2 = license_bytes
+        elif feature_bytes:
+            plate_photo_2 = feature_bytes
+        elif license_bytes:
+            plate_photo_2 = license_bytes
+        
+        print(f"[HIK] Selected photos for Gemini: plate_1={'present' if plate_photo_1 else 'none'}, "
+              f"plate_2={'present' if plate_photo_2 else 'none'}, "
+              f"snow={'present' if snow_photo_bytes else 'none'}")
+        
+        # 4. Вызываем Gemini для анализа (если есть снег и хотя бы одно фото номера)
+        gemini_result = None
+        if snow_photo_bytes and plate_photo_1:
+            try:
+                print(f"[HIK] Calling Gemini for analysis...")
+                gemini_result = await merger.analyze_with_gemini(
+                    snow_photo=snow_photo_bytes,
+                    plate_photo_1=plate_photo_1,
+                    plate_photo_2=plate_photo_2,
+                )
+                print(f"[HIK] Gemini result: {gemini_result}")
+            except Exception as e:
+                print(f"[HIK] ERROR calling Gemini: {e}")
+                import traceback
+                print(f"[HIK] Traceback: {traceback.format_exc()}")
+                gemini_result = {"error": str(e)}
+        
+        # 5. Используем результаты от Gemini
+        # Номер: от Gemini, если распознан, иначе от камеры/модели
+        final_plate = main_plate
+        if gemini_result and gemini_result.get("plate"):
+            final_plate = gemini_result.get("plate")
+            print(f"[HIK] Using plate from Gemini: '{final_plate}'")
+        else:
+            print(f"[HIK] Using plate from camera/model: '{final_plate}'")
+        
+        event_data["plate"] = final_plate
+        
+        # Процент снега и confidence от Gemini
+        snow_percentage = 0.0
+        snow_confidence = 0.0
+        if gemini_result:
+            snow_percentage = gemini_result.get("snow_percentage", 0.0)
+            snow_confidence = gemini_result.get("snow_confidence", 0.0)
+            if "error" in gemini_result:
+                print(f"[HIK] WARNING: Gemini returned error: {gemini_result.get('error')}")
+        
+        event_data["snow_volume_percentage"] = snow_percentage
+        event_data["snow_volume_confidence"] = snow_confidence
+        event_data["matched_snow"] = snow_photo_bytes is not None
+        
+        # Добавляем данные от Gemini в event_data для логирования
+        if gemini_result:
+            event_data["gemini_result"] = gemini_result
+        
+        # 6. Отправляем на upstream со всеми фотографиями
+        print(f"[HIK] 📤 Sending event to upstream: plate='{final_plate}', event_id={event_id}")
+        upstream_result = await send_to_upstream(
+            event_data=event_data,
             detection_bytes=detection_bytes,
             feature_bytes=feature_bytes,
             license_bytes=license_bytes,
+            snow_bytes=snow_photo_bytes,  # Добавляем фото снега
         )
 
-        # 6) Логируем в detections.log (включая статус отправки и данные снега)
+        # 7. Логируем в detections.log
         log_event = {
             **event_data,
             "upstream_sent": upstream_result["sent"],
             "upstream_status": upstream_result["status"],
             "upstream_error": upstream_result["error"],
-            "matched_snow": upstream_result.get("matched_snow"),
+            "snow_photo_captured": snow_photo_bytes is not None,
         }
-        
-        # Добавляем данные снега в лог, если они есть
-        if "snow_data" in upstream_result:
-            log_event.update(upstream_result["snow_data"])
 
         log_path = BASE_DIR / "detections.log"
         with log_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(log_event, ensure_ascii=False) + "\n")
 
-        # 7) Ответ камере — просто "ok"
+        if upstream_result["sent"]:
+            print(f"[HIK] ✅ Event sent successfully to upstream (status={upstream_result['status']})")
+        else:
+            print(f"[HIK] ❌ Failed to send event to upstream: {upstream_result.get('error')}")
+
+        # 8) Ответ камере — просто "ok"
+        print(f"[HIK] === EVENT PROCESSING COMPLETE ===\n")
         return JSONResponse({"status": "ok"})
 
     # === ВАРИАНТ 2: fallback — ищем JPEG прямо в body (редкий случай) ===
@@ -711,11 +858,56 @@ async def hikvision_isapi(request: Request):
             f.write(json.dumps(log_event, ensure_ascii=False) + "\n")
         return JSONResponse({"status": "ok"})
 
+    # === НОВАЯ ЛОГИКА для fallback варианта ===
+    
+    # 1. Генерируем event_id
+    event_id = str(uuid.uuid4())
+    
+    # 2. Захватываем фото снега
+    snow_photo_bytes = None
+    if ENABLE_SNOW_WORKER:
+        try:
+            from snow_worker import capture_snow_photo
+            print(f"[HIK] (fallback) Requesting snow photo capture...")
+            snow_photo_bytes = capture_snow_photo()
+            if snow_photo_bytes:
+                print(f"[HIK] (fallback) Snow photo captured, size={len(snow_photo_bytes)} bytes")
+        except Exception as e:
+            print(f"[HIK] (fallback) ERROR capturing snow photo: {e}")
+    
+    # 3. Вызываем Gemini (если есть снег)
+    gemini_result = None
+    if snow_photo_bytes and jpg_bytes:
+        try:
+            print(f"[HIK] (fallback) Calling Gemini for analysis...")
+            gemini_result = await merger.analyze_with_gemini(
+                snow_photo=snow_photo_bytes,
+                plate_photo_1=jpg_bytes,
+                plate_photo_2=None,
+            )
+            print(f"[HIK] (fallback) Gemini result: {gemini_result}")
+        except Exception as e:
+            print(f"[HIK] (fallback) ERROR calling Gemini: {e}")
+            gemini_result = {"error": str(e)}
+    
+    # 4. Используем результаты от Gemini
+    final_plate = main_plate
+    if gemini_result and gemini_result.get("plate"):
+        final_plate = gemini_result.get("plate")
+        print(f"[HIK] (fallback) Using plate from Gemini: '{final_plate}'")
+    
+    snow_percentage = 0.0
+    snow_confidence = 0.0
+    if gemini_result:
+        snow_percentage = gemini_result.get("snow_percentage", 0.0)
+        snow_confidence = gemini_result.get("snow_confidence", 0.0)
+
     event_data: Dict[str, Any] = {
         # контракт бэкенда (обязательные поля)
         "camera_id": PLATE_CAMERA_ID,
         "event_time": now_iso,  # RFC3339 формат с timezone
-        "plate": main_plate,
+        "event_id": event_id,
+        "plate": final_plate,
         "confidence": float(model_ocr_conf) if model_ocr_conf is not None else 0.0,  # обязательное поле
         "direction": "unknown",  # обязательное поле
         "lane": 0,  # обязательное поле
@@ -726,16 +918,22 @@ async def hikvision_isapi(request: Request):
         "model_plate": model_plate,
         "model_det_conf": model_det_conf,
         "model_ocr_conf": model_ocr_conf,
-
+        "snow_volume_percentage": snow_percentage,
+        "snow_volume_confidence": snow_confidence,
+        "matched_snow": snow_photo_bytes is not None,
         "timestamp": now_iso,
     }
+    
+    if gemini_result:
+        event_data["gemini_result"] = gemini_result
 
-    # Отправляем только одну картинку как detection_picture
-    upstream_result = await merger.combine_and_send(
-        anpr_event=event_data,
+    # Отправляем на upstream
+    upstream_result = await send_to_upstream(
+        event_data=event_data,
         detection_bytes=jpg_bytes,
         feature_bytes=None,
         license_bytes=None,
+        snow_bytes=snow_photo_bytes,
     )
 
     log_event = {
@@ -744,12 +942,8 @@ async def hikvision_isapi(request: Request):
         "upstream_status": upstream_result["status"],
         "upstream_error": upstream_result["error"],
         "anpr_bbox": model_bbox,
-        "matched_snow": upstream_result.get("matched_snow"),
+        "snow_photo_captured": snow_photo_bytes is not None,
     }
-    
-    # Добавляем данные снега в лог, если они есть
-    if "snow_data" in upstream_result:
-        log_event.update(upstream_result["snow_data"])
 
     log_path = BASE_DIR / "detections.log"
     with log_path.open("a", encoding="utf-8") as f:

@@ -1,20 +1,21 @@
 import os
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple
+from collections import deque
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
-from ultralytics import YOLO
 
-from combined_merger import init_merger
+# Убрали YOLO и combined_merger - больше не нужны для автоматических событий
 
 # === Конфиг через переменные окружения ===
 
 SNOW_VIDEO_SOURCE_URL = os.getenv("SNOW_VIDEO_SOURCE_URL", "")
 SNOW_CAMERA_ID = os.getenv("SNOW_CAMERA_ID", "camera-snow")
-SNOW_YOLO_MODEL_PATH = os.getenv("SNOW_YOLO_MODEL_PATH", "yolov8n.pt")
+SNOW_CAPTURE_DELAY_SECONDS = float(os.getenv("SNOW_CAPTURE_DELAY_SECONDS", "1.0"))  # Задержка перед захватом фото
 
 TRUCK_CLASS_ID = int(os.getenv("SNOW_TRUCK_CLASS_ID", "7"))
 CONFIDENCE_THRESHOLD = float(os.getenv("SNOW_CONFIDENCE_THRESHOLD", "0.55"))
@@ -65,11 +66,85 @@ _silence_opencv_logs()
 
 _snow_thread: threading.Thread | None = None
 _stop_event = threading.Event()
+_cap: cv2.VideoCapture | None = None
+_cap_lock = threading.Lock()
+
+# Буфер кадров с временными метками для доступа к прошлым кадрам
+@dataclass
+class TimestampedFrame:
+    frame: np.ndarray
+    timestamp: float  # time.time()
+
+_frame_buffer: deque[TimestampedFrame] = deque(maxlen=150)  # ~5 секунд при 30 FPS
+_frame_buffer_lock = threading.Lock()
+BUFFER_DURATION_SECONDS = 5.0  # Храним кадры за последние 5 секунд
 
 
-# === Вспомогательные функции из старого снежного сервиса ===
+# === Функция захвата фото по запросу ===
 
-def _detect_truck_bbox(frame: np.ndarray, model: YOLO) -> Optional[Tuple[int, int, int, int]]:
+def capture_snow_photo(delay_seconds: Optional[float] = None) -> Optional[bytes]:
+    """
+    Захватывает кадр из буфера снеговой камеры, который был записан delay_seconds назад.
+    Это нужно потому что камера по снегу стоит раньше камеры по номерам, и когда приходит
+    событие от камеры номеров, машина уже проехала мимо снеговой камеры.
+    
+    Args:
+        delay_seconds: Сколько секунд назад был записан нужный кадр (если None, используется SNOW_CAPTURE_DELAY_SECONDS)
+    
+    Returns:
+        JPEG bytes кадра или None, если не удалось найти подходящий кадр
+    """
+    global _frame_buffer
+    
+    # Используем переданную задержку или значение из конфига
+    target_delay = delay_seconds if delay_seconds is not None else SNOW_CAPTURE_DELAY_SECONDS
+    
+    current_time = time.time()
+    target_timestamp = current_time - target_delay
+    
+    print(f"[SNOW] capture_snow_photo: looking for frame from {target_delay:.2f}s ago (target_timestamp={target_timestamp:.3f}, current={current_time:.3f})")
+    
+    with _frame_buffer_lock:
+        if len(_frame_buffer) == 0:
+            print("[SNOW] capture_snow_photo: frame buffer is empty")
+            return None
+        
+        # Ищем кадр, который ближе всего к целевому времени
+        best_frame = None
+        best_delta = float('inf')
+        
+        for timestamped_frame in _frame_buffer:
+            delta = abs(timestamped_frame.timestamp - target_timestamp)
+            if delta < best_delta:
+                best_delta = delta
+                best_frame = timestamped_frame
+        
+        if best_frame is None:
+            print("[SNOW] capture_snow_photo: no suitable frame found in buffer")
+            return None
+        
+        actual_delay = current_time - best_frame.timestamp
+        print(f"[SNOW] capture_snow_photo: found frame from {actual_delay:.2f}s ago (requested {target_delay:.2f}s, delta={best_delta:.3f}s)")
+        
+        frame = best_frame.frame.copy()
+    
+    # Кодируем кадр в JPEG
+    try:
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        if not ok:
+            print("[SNOW] capture_snow_photo: failed to encode frame to JPEG")
+            return None
+        photo_bytes = buf.tobytes()
+        print(f"[SNOW] capture_snow_photo: encoded frame, size={len(photo_bytes)} bytes")
+        return photo_bytes
+    except Exception as e:
+        print(f"[SNOW] capture_snow_photo: error encoding frame: {e}")
+        return None
+
+
+# === Старые вспомогательные функции (оставлены для возможного будущего использования) ===
+
+def _detect_truck_bbox(frame: np.ndarray, model) -> Optional[Tuple[int, int, int, int]]:
     """
     Находит bbox грузовика (class=TRUCK_CLASS_ID) с приоритетом ближе к камере и в центральной полосе.
     Приоритет: больший y2 (ниже в кадре) + площадь, бонус за пересечение узкой средней зоны,
@@ -170,14 +245,18 @@ def _encode_frame_to_jpeg(frame: np.ndarray) -> Tuple[bytes, datetime]:
     return buf.tobytes(), ts
 
 
-# === Основной цикл снежной камеры ===
+# === Основной цикл снежной камеры (упрощенный - только чтение потока) ===
 
 def _snow_loop(upstream_url: str):
-    model = YOLO(SNOW_YOLO_MODEL_PATH)
-    merger = init_merger(upstream_url)
-
-    cap = cv2.VideoCapture(SNOW_VIDEO_SOURCE_URL, cv2.CAP_FFMPEG)
-    if not cap.isOpened():
+    """
+    Упрощенный цикл: читает RTSP поток и сохраняет кадры в буфер с временными метками.
+    Автоматические события больше не создаются - фото делается по запросу через capture_snow_photo().
+    Кадры сохраняются в буфер, чтобы можно было получить кадр из прошлого (когда машина была под снеговой камерой).
+    """
+    global _cap, _frame_buffer
+    
+    _cap = cv2.VideoCapture(SNOW_VIDEO_SOURCE_URL, cv2.CAP_FFMPEG)
+    if not _cap.isOpened():
         print(f"[SNOW] cannot open video source: {SNOW_VIDEO_SOURCE_URL}")
         return
 
@@ -186,344 +265,52 @@ def _snow_loop(upstream_url: str):
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(window_name, 960, 540)
 
-    last_center_x = None
-    event_sent_for_current_truck = False
-    last_movement_time = None  # Время последнего значимого движения
-    last_truck_bbox = None  # Последний bbox для отслеживания смены машины
-    last_truck_was_r_to_l = False  # Флаг: последняя машина двигалась справа налево (сохраняется между кадрами)
-    r2l_confirmations = 0  # Сколько раз подряд подтвердили движение R→L для текущей машины
-    ignore_current_truck = False  # Флаг: игнорировать текущую машину (R→L подтверждена или стоит слишком долго)
-
-    frame_width = None
-    frame_height = None
-    center_start_px = None
-    center_end_px = None
-    center_start_py = None
-    center_end_py = None
-    center_x_geom = None
-
     fail_count = 0
     MAX_FAILS = 15
-    frame_count = 0
-    miss_count = 0          # Счетчик подряд идущих кадров без детекции
-    MISS_RESET_THRESHOLD = MISS_RESET_THRESHOLD_ENV  # После скольких пропусков сбрасывать трекинг
-    leave_count = 0         # Счетчик подряд идущих кадров без детекции для определения, что машина ушла
-    stationary_block = False  # Блокируем мгновенную переотправку после сброса стоячей машины
+    last_log_time = 0.0
+    LOG_INTERVAL_SECONDS = 8.0  # Логируем раз в 8 секунд
 
-    print("[SNOW] worker started")
+    print(f"[SNOW] worker started (buffering mode - storing frames for {BUFFER_DURATION_SECONDS}s)")
     while not _stop_event.is_set():
-        ret, frame = cap.read()
+        with _cap_lock:
+            ret, frame = _cap.read()
+        
         if not ret or frame is None or frame.size == 0:
             fail_count += 1
             if fail_count >= MAX_FAILS:
-                cap.release()
-                time.sleep(2)
-                cap = cv2.VideoCapture(SNOW_VIDEO_SOURCE_URL, cv2.CAP_FFMPEG)
+                with _cap_lock:
+                    _cap.release()
+                    time.sleep(2)
+                    _cap = cv2.VideoCapture(SNOW_VIDEO_SOURCE_URL, cv2.CAP_FFMPEG)
                 fail_count = 0
             time.sleep(0.05)
             continue
 
         fail_count = 0
-        frame_count += 1
-        raw_frame = frame.copy()
-
-        if frame_width is None:
-            frame_height, frame_width = frame.shape[:2]
-            center_start_px = int(frame_width * CENTER_ZONE_START_X)
-            center_end_px = int(frame_width * CENTER_ZONE_END_X)
-            center_start_py = int(frame_height * CENTER_ZONE_START_Y)
-            center_end_py = int(frame_height * CENTER_ZONE_END_Y)
-            center_x_geom = int(frame_width * CENTER_LINE_X)
-            print(f"[SNOW] center zone X: {center_start_px}px .. {center_end_px}px (width: {frame_width}px)")
-            print(f"[SNOW] center zone Y: {center_start_py}px .. {center_end_py}px (height: {frame_height}px)")
-
-        # Отрисовка вспомогательных линий (только для визуального контроля)
-        if SHOW_WINDOW:
-            cv2.line(frame, (center_x_geom, 0), (center_x_geom, frame_height), (0, 255, 255), 1)
-            cv2.line(frame, (center_start_px, 0), (center_start_px, frame_height), (0, 255, 0), 2)
-            cv2.line(frame, (center_end_px, 0), (center_end_px, frame_height), (0, 255, 0), 2)
-            cv2.line(frame, (0, center_start_py), (frame_width, center_start_py), (0, 255, 0), 2)
-            cv2.line(frame, (0, center_end_py), (frame_width, center_end_py), (0, 255, 0), 2)
-
-        bbox = _detect_truck_bbox(raw_frame, model)
-        if bbox:
-            leave_count = 0  # Есть детекция — сбрасываем счетчик ухода
-            in_zone, center_x_obj, center_y_obj, zone_start_px, zone_end_px, zone_start_py, zone_end_py = _check_center_zone(bbox, frame_width, frame_height)
-            
-            # Проверяем, не сменилась ли машина (по значительному изменению bbox)
-            is_new_truck = False
-            if last_truck_bbox is not None:
-                # Вычисляем IoU (Intersection over Union) или просто расстояние между центрами
-                last_x1, last_y1, last_x2, last_y2 = last_truck_bbox
-                last_center_x_bbox = (last_x1 + last_x2) // 2
-                last_center_y_bbox = (last_y1 + last_y2) // 2
-                current_center_x_bbox = (bbox[0] + bbox[2]) // 2
-                current_center_y_bbox = (bbox[1] + bbox[3]) // 2
-                
-                # Если центр сместился больше чем на 30% размера кадра, это новая машина
-                distance_threshold = max(frame_width, frame_height) * 0.3
-                center_distance = ((current_center_x_bbox - last_center_x_bbox) ** 2 + 
-                                 (current_center_y_bbox - last_center_y_bbox) ** 2) ** 0.5
-                if center_distance > distance_threshold:
-                    is_new_truck = True
-                    print(f"[SNOW] new truck detected (center distance={center_distance:.1f}px > {distance_threshold:.1f}px), resetting tracking")
-                    last_center_x = None
-                    event_sent_for_current_truck = False
-                    last_movement_time = None
-                    last_truck_was_r_to_l = False  # Новая машина - сбрасываем флаг R→L
-                    r2l_confirmations = 0
-                    ignore_current_truck = False
-            
-            # Логируем состояние для диагностики (только при детекции)
-            # Не логируем если машина стоит слишком долго (чтобы не спамить)
-            should_log_detection = True
-            if last_movement_time is not None:
-                time_since_movement = time.time() - last_movement_time
-                if time_since_movement > STATIONARY_TIMEOUT_SECONDS:
-                    should_log_detection = False  # Не логируем стоячие машины
-            
-            if should_log_detection:
-                x1, y1, x2, y2 = bbox
-                print(f"[SNOW] TRUCK DETECTED: bbox=({x1},{y1},{x2},{y2}), in_zone={in_zone}, "
-                      f"center=({center_x_obj:.1f},{center_y_obj:.1f})px, "
-                      f"zone_x={zone_start_px}-{zone_end_px}px, zone_y={zone_start_py}-{zone_end_py}px, "
-                      f"last_center_x={last_center_x}, event_sent={event_sent_for_current_truck}, "
-                      f"is_new_truck={is_new_truck}")
-            
-            # Проверяем направление движения
-            moving_right = _is_moving_left_to_right(center_x_obj, last_center_x)
-            
-            # Отслеживаем, было ли движение справа налево в текущем кадре.
-            # При множественных подтверждениях R→L игнорируем эту машину, пока она не пропадет из кадра.
-            current_frame_r_to_l = False
-            if last_center_x is not None:
-                delta = center_x_obj - last_center_x
-                if delta < -MIN_DIRECTION_DELTA:  # Движение справа налево
-                    current_frame_r_to_l = True
-                    last_truck_was_r_to_l = True  # Сохраняем флаг для следующих кадров
-                    r2l_confirmations += 1
-                    if r2l_confirmations >= R2L_CONFIRM_THRESHOLD:
-                        ignore_current_truck = True
-                        print(f"[SNOW] confirmed R→L {r2l_confirmations} times (>= {R2L_CONFIRM_THRESHOLD}), ignoring this truck until it leaves")
-                elif delta > MIN_DIRECTION_DELTA:
-                    # Движение в нужную сторону сбрасывает подтверждения R→L
-                    r2l_confirmations = 0
-            
-            # Сохраняем флаг первого обнаружения ДО установки last_center_x
-            is_first_detection = (last_center_x is None and in_zone)
-            is_first_in_left_half = (is_first_detection and 
-                                     center_x_obj < (zone_start_px + zone_end_px) // 2)
-            
-            # Если это первое обнаружение в зоне - сохраняем позицию для следующего кадра.
-            # ВАЖНО: не сбрасываем флаг R→L на первом кадре, чтобы не пропускать
-            # последовательное движение справа-налево.
-            if is_first_detection:
-                # Считаем, что это новое появление в кадре — сбрасываем игнор после R→L
-                if ignore_current_truck:
-                    print("[SNOW] reset ignore flag for new truck (first detection in zone)")
-                ignore_current_truck = False
-                r2l_confirmations = 0
-                last_truck_was_r_to_l = False
-                last_center_x = center_x_obj
-                last_movement_time = time.time()  # Фиксируем время первого обнаружения
-                print(f"[SNOW] first detection in zone (center_x={center_x_obj:.1f}px), saved for direction check")
-            # Если грузовик движется слева направо - обновляем позицию и время движения
-            elif moving_right:
-                last_center_x = center_x_obj
-                last_movement_time = time.time()  # Обновляем время последнего движения
-                r2l_confirmations = 0
-                if stationary_block:
-                    print("[SNOW] movement resumed, clearing stationary block")
-                stationary_block = False
-                if ignore_current_truck:
-                    print(f"[SNOW] truck now moving left-to-right, stopping ignore (center_x={center_x_obj:.1f}px)")
-                ignore_current_truck = False
-                # Если машина движется L→R, сбрасываем флаг R→L (подтверждение правильного направления)
-                if last_truck_was_r_to_l:
-                    print(f"[SNOW] truck moving left-to-right (center_x={center_x_obj:.1f}px), resetting R→L flag, tracking updated")
-                    last_truck_was_r_to_l = False
+        
+        # Сохраняем кадр в буфер с временной меткой
+        current_timestamp = time.time()
+        timestamped_frame = TimestampedFrame(frame=frame.copy(), timestamp=current_timestamp)
+        
+        with _frame_buffer_lock:
+            # Удаляем старые кадры (старше BUFFER_DURATION_SECONDS)
+            while len(_frame_buffer) > 0:
+                oldest = _frame_buffer[0]
+                if current_timestamp - oldest.timestamp > BUFFER_DURATION_SECONDS:
+                    _frame_buffer.popleft()
                 else:
-                    print(f"[SNOW] truck moving left-to-right (center_x={center_x_obj:.1f}px), tracking updated")
-            # Если грузовик движется справа налево - сбрасываем отслеживание
-            # Это уезжающие машины, их нужно игнорировать
-            elif last_center_x is not None:
-                delta = center_x_obj - last_center_x
-                if delta < -MIN_DIRECTION_DELTA:  # Движение справа налево (уезжающая машина)
-                    print(f"[SNOW] FILTERED: truck moving right-to-left (delta={delta:.1f}px) - exiting vehicle, resetting tracking, setting R→L flag")
-                    last_center_x = None
-                    event_sent_for_current_truck = False
-                    last_movement_time = None
-                    last_truck_was_r_to_l = True  # Сохраняем флаг R→L для следующих кадров
-                    ignore_current_truck = True  # Явно игнорируем уезжающую машину
-                elif abs(delta) <= MIN_DIRECTION_DELTA:
-                    # Грузовик стоит на месте или движется очень медленно
-                    print(f"[SNOW] truck stationary or slow (delta={delta:.1f}px), keeping position")
-                    # Не обновляем last_movement_time - машина стоит
-
-            # Всегда рисуем квадратик на frame для логирования (даже если окно не показывается)
-            x1, y1, x2, y2 = bbox
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-            # Показываем направление движения
-            if last_center_x is not None:
-                if moving_right:
-                    cv2.putText(frame, "->", (x2 + 10, y1), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                elif center_x_obj < last_center_x - MIN_DIRECTION_DELTA:
-                    cv2.putText(frame, "<-", (x2 + 10, y1), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                    break
             
-            if SHOW_WINDOW:
-                # Дополнительная визуализация только если окно включено
-                pass
-
-            # Сохраняем снапшот и кладем в очередь без анализа, если:
-            # 1. Грузовик в зоне
-            # 2. Движется слева направо (подтверждено) ИЛИ это первое обнаружение в зоне
-            # 3. Еще не отправлено событие для этого грузовика
-            # 4. Машина не стоит слишком долго (если не первое обнаружение)
-            # 5. НЕ движется справа налево в текущем кадре
-            in_middle_zone = center_start_px + int((center_end_px - center_start_px) * (MIDDLE_ZONE_START_X - CENTER_ZONE_START_X) / (CENTER_ZONE_END_X - CENTER_ZONE_START_X)) <= center_x_obj <= \
-                              center_start_px + int((center_end_px - center_start_px) * (MIDDLE_ZONE_END_X - CENTER_ZONE_START_X) / (CENTER_ZONE_END_X - CENTER_ZONE_START_X))
+            # Добавляем новый кадр
+            _frame_buffer.append(timestamped_frame)
             
-            # Проверяем, не стоит ли машина слишком долго
-            should_process_truck = True
-            if not is_first_detection and last_movement_time is not None:
-                time_since_movement = time.time() - last_movement_time
-                if time_since_movement > STATIONARY_HARD_TIMEOUT_SECONDS:
-                    print(f"[SNOW] truck stationary too long ({time_since_movement:.1f}s > {STATIONARY_HARD_TIMEOUT_SECONDS}s), ignoring this truck until it leaves")
-                    ignore_current_truck = True
-                    last_center_x = None
-                    event_sent_for_current_truck = False
-                    last_movement_time = None
-                    last_truck_bbox = None
-                    last_truck_was_r_to_l = False
-                    r2l_confirmations = 0
-                    stationary_block = True  # блокируем моментальную переотправку
-                    should_process_truck = False
-                elif time_since_movement > STATIONARY_TIMEOUT_SECONDS:
-                    # Сбрасываем трекинг для стоячей машины, чтобы не логировать постоянно
-                    # и чтобы система могла начать отслеживать новую машину
-                    print(f"[SNOW] truck stationary too long ({time_since_movement:.1f}s > {STATIONARY_TIMEOUT_SECONDS}s), resetting tracking")
-                    last_center_x = None
-                    event_sent_for_current_truck = False
-                    last_movement_time = None
-                    last_truck_bbox = None
-                    last_truck_was_r_to_l = False  # Стоячая машина - сбрасываем флаг R→L
-                    r2l_confirmations = 0
-                    stationary_block = True  # не шлём событие сразу после сброса стоячей
-                    should_process_truck = False  # Пропускаем дальнейшую обработку для этой стоячей машины
-            
-            # Обрабатываем только если машина не стоит слишком долго
-            if should_process_truck:
-                # Упрощенные условия для добавления события:
-                # 1. Машина в зоне
-                # 2. Еще не отправлено событие для этого грузовика
-                # 3. Движется слева направо ИЛИ это первое обнаружение в зоне
-                # 4. НЕ движется справа налево в текущем кадре
-                # 5. НЕ игнорируется (не было подтвержденного движения R→L)
-                # Убрали требование in_middle_zone для упрощения - если машина в зоне и движется L→R, добавляем
-                should_add_event = (
-                    in_zone
-                    and not event_sent_for_current_truck
-                    and (moving_right or SNOW_ALLOW_R2L_EVENT or is_first_detection)  # Убрали проверку stationary_block для первого обнаружения, чтобы события создавались сразу
-                    and (SNOW_ALLOW_R2L_EVENT or not current_frame_r_to_l)
-                    and not ignore_current_truck
-                )
-                
-                # Подробное логирование для диагностики (всегда логируем, если машина в зоне и событие еще не отправлено)
-                if in_zone and not event_sent_for_current_truck:
-                    print(
-                        "[SNOW] DEBUG: in_zone=True, event_sent=False, "
-                        f"moving_right={moving_right}, is_first_detection={is_first_detection}, "
-                        f"current_frame_r_to_l={current_frame_r_to_l}, "
-                        f"ignore_current_truck={ignore_current_truck}, in_middle_zone={in_middle_zone}, "
-                        f"center_x={center_x_obj:.1f}px, center_x_geom={center_x_geom}px, "
-                        f"should_add_event={should_add_event}"
-                    )
-                    if not should_add_event:
-                        # Детальная диагностика, почему событие не добавляется
-                        reasons = []
-                        if not in_zone:
-                            reasons.append("not in zone")
-                        if event_sent_for_current_truck:
-                            reasons.append("event already sent")
-                        if not (moving_right or SNOW_ALLOW_R2L_EVENT or is_first_detection):
-                            reasons.append(f"not moving right and not first detection (moving_right={moving_right}, is_first_detection={is_first_detection}, allow_r2l={SNOW_ALLOW_R2L_EVENT})")
-                        if current_frame_r_to_l:
-                            reasons.append("current frame R→L")
-                        if ignore_current_truck:
-                            reasons.append("truck ignored")
-                        print(f"[SNOW] DEBUG: event NOT added, reasons: {', '.join(reasons) if reasons else 'unknown'}")
-                
-                if should_add_event:
-                    print(f"[SNOW] ===== ENCODING SNAPSHOT AND QUEUING (IN-MEMORY) ======")
-                    try:
-                        photo_bytes, ts_saved = _encode_frame_to_jpeg(raw_frame)
-                    except Exception as e:
-                        print(f"[SNOW] cannot encode frame to JPEG: {e}")
-                        photo_bytes = None
-                        ts_saved = datetime.now(tz=timezone.utc)
-
-                    # Формируем время события в RFC3339 (ISO8601) с суффиксом Z
-                    event_time_iso = ts_saved.replace(microsecond=0).isoformat()
-                    if event_time_iso.endswith("+00:00"):
-                        event_time_iso = event_time_iso[:-6] + "Z"
-                    elif "+" in event_time_iso or "-" in event_time_iso[-6:]:
-                        pass
-                    else:
-                        event_time_iso += "Z"
-                    
-                    payload = {
-                        "camera_id": SNOW_CAMERA_ID,
-                        "event_time": event_time_iso,
-                        "bbox": list(bbox) if bbox else None,
-                    }
-                    print(f"[SNOW] payload queued (no Gemini yet): {payload}")
-
-                    merger.add_snow_event(payload, photo_bytes)
-                    print(f"[SNOW] snow event added to queue at {ts_saved.isoformat()}, "
-                          f"photo_size={len(photo_bytes) if photo_bytes else 0} bytes, "
-                          f"queue_size should increase")
-                    event_sent_for_current_truck = True
-                    last_truck_bbox = bbox  # Сохраняем bbox для отслеживания смены машины
-                elif in_zone and not moving_right and last_center_x is not None and not event_sent_for_current_truck:
-                    # Грузовик в зоне, но направление еще не подтверждено
-                    # Логируем только если прошло меньше 2 секунд с последнего движения (чтобы не спамить)
-                    if last_movement_time is None or (time.time() - last_movement_time) < 2.0:
-                        print(f"[SNOW] truck in zone, waiting for direction confirmation (center_x={center_x_obj:.1f}px, last={last_center_x:.1f}px)")
-                    last_truck_bbox = bbox  # Обновляем bbox даже если событие не добавлено
-            elif not in_zone:
-                # Грузовик детектирован, но не в зоне - сбрасываем состояние для следующей машины
-                print(f"[SNOW] truck detected but NOT in zone: center=({center_x_obj:.1f},{center_y_obj:.1f}), "
-                      f"zone_x={zone_start_px}-{zone_end_px}, zone_y={zone_start_py}-{zone_end_py}, "
-                      f"bbox=({x1},{y1},{x2},{y2}), resetting tracking for next truck")
-                # Сбрасываем состояние, чтобы следующая машина могла быть детектирована
-                event_sent_for_current_truck = False
-                last_center_x = None
-                last_movement_time = None
-                last_truck_bbox = None
-                last_truck_was_r_to_l = False  # Машина покинула зону - сбрасываем флаг R→L
-                r2l_confirmations = 0
-                ignore_current_truck = False
-        else:
-            # Грузовик не детектирован - даем небольшой допуск на пропуски
-            miss_count += 1
-            leave_count += 1
-
-            # Если подряд много пропусков, считаем что машина ушла из кадра и разрешаем новые события
-            if leave_count >= LEAVE_RESET_THRESHOLD:
-                if last_truck_bbox is not None or last_center_x is not None or event_sent_for_current_truck:
-                    print(f"[SNOW] truck likely left scene (no detect for {leave_count} frames), resetting tracking for next truck")
-                event_sent_for_current_truck = False
-                last_center_x = None
-                last_movement_time = None
-                last_truck_bbox = None
-                last_truck_was_r_to_l = False
-                r2l_confirmations = 0
-                ignore_current_truck = False
-                leave_count = 0
-                miss_count = 0
-
-            # Небольшая пауза, чтобы не крутить цикл слишком быстро при пропусках
-            time.sleep(0.02)
+            # Логируем раз в 8 секунд
+            if current_timestamp - last_log_time >= LOG_INTERVAL_SECONDS:
+                if len(_frame_buffer) > 0:
+                    print(f"[SNOW] buffer size: {len(_frame_buffer)} frames, "
+                          f"oldest: {current_timestamp - _frame_buffer[0].timestamp:.2f}s ago, "
+                          f"newest: {current_timestamp - _frame_buffer[-1].timestamp:.2f}s ago")
+                last_log_time = current_timestamp
 
         if SHOW_WINDOW:
             cv2.imshow(window_name, cv2.resize(frame, (960, 540)))
@@ -532,10 +319,13 @@ def _snow_loop(upstream_url: str):
                 _stop_event.set()
                 break
 
-        # небольшая пауза, чтобы не грузить CPU
-        time.sleep(0.005)
+        # Небольшая пауза, чтобы не грузить CPU
+        time.sleep(0.01)
 
-    cap.release()
+    with _cap_lock:
+        if _cap is not None:
+            _cap.release()
+            _cap = None
     if SHOW_WINDOW:
         cv2.destroyAllWindows()
     print("[SNOW] worker stopped")
@@ -544,6 +334,7 @@ def _snow_loop(upstream_url: str):
 def start_snow_worker(upstream_url: str):
     """
     Запуск снегового воркера в отдельном потоке.
+    Теперь воркер только читает RTSP поток и сохраняет кадры в памяти.
     """
     global _snow_thread
     if _snow_thread is not None:
