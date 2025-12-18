@@ -139,8 +139,10 @@ def _normalize_single(text: str) -> Optional[str]:
 
 def normalize_plate(raw_text: str) -> Optional[str]:
     """
-    Возвращаем очищенный от мусора, но без дополнительной нормализации номер.
-    Если после очистки строка пустая — None.
+    Базовая чистка без жесткой валидации: оставляем A-Z0-9,
+    применяем точечные фиксы региона и возвращаем строку
+    даже если формат не прошел. Используется там, где нужна
+    обратная совместимость.
     """
     if not raw_text:
         return None
@@ -150,13 +152,79 @@ def normalize_plate(raw_text: str) -> Optional[str]:
         return None
 
     # Точечный фикс: если в конце «115» или «155» — считаем, что регион должен быть «15».
-    m = re.match(r'^(?P<prefix>\d{2,3}[A-Z]{2,3})(?P<suf>115|155)$', text)
+    m = re.match(r"^(?P<prefix>\d{2,3}[A-Z]{2,3})(?P<suf>115|155)$", text)
     if m:
         return f"{m.group('prefix')}15"
 
     # Если в конце «19» — тоже считаем, что регион «15».
-    m = re.match(r'^(?P<prefix>\d{2,3}[A-Z]{2,3})19$', text)
+    m = re.match(r"^(?P<prefix>\d{2,3}[A-Z]{2,3})19$", text)
     if m:
         return f"{m.group('prefix')}15"
 
     return text
+
+
+# ================== Строгая валидация основных форматов ==================
+# Основные форматы: 3 цифры + 3 буквы + 2 цифры (тип1_3L) и
+# 3 цифры + 2 буквы + 2 цифры (тип1_2L). Остальные (грузовые, квадратные)
+# считаем второстепенными и здесь не принимаем.
+PRIMARY_PATTERNS = {
+    "type1_3L",
+    "type1_2L",
+}
+
+
+def match_primary_plate(text: str) -> Optional[Tuple[str, re.Match]]:
+    """Пробуем сопоставить только с основными паттернами (type1_3L/type1_2L)."""
+    for plate_type, pattern in PATTERNS:
+        if plate_type not in PRIMARY_PATTERNS:
+            continue
+        m = pattern.match(text)
+        if not m:
+            continue
+        reg = m.groupdict().get("reg")
+        if reg is not None and reg not in REGIONS:
+            continue
+        return plate_type, m
+    return None
+
+
+def normalize_primary_plate(raw_text: str) -> Optional[str]:
+    """
+    Жесткая нормализация только под основные форматы (3+3+2, 3+2+2).
+    Возвращает нормализованный номер или None, если формат не прошел.
+    """
+    if not raw_text:
+        return None
+
+    text = clean_ocr_text(raw_text)
+    if not text:
+        return None
+
+    # Популярная ошибка: разделительная полоска читается как "1" → хвосты 115/155/19,
+    # приводим к региону 15.
+    m = re.match(r"^(?P<prefix>\d{2,3}[A-Z]{2,3})(?P<suf>115|155)$", text)
+    if m:
+        text = f"{m.group('prefix')}15"
+    else:
+        m = re.match(r"^(?P<prefix>\d{2,3}[A-Z]{2,3})19$", text)
+        if m:
+            text = f"{m.group('prefix')}15"
+
+    text = try_fix_confusions(text)
+    res = match_primary_plate(text)
+    if not res:
+        return None
+
+    plate_type, m = res
+    g = m.groupdict()
+
+    if plate_type.startswith("type1"):
+        return f"{g['num']}{g['letters']}{g['reg']}"
+
+    return None
+
+
+def is_primary_plate_format(raw_text: str) -> bool:
+    """Проверяем, соответствует ли строка строгому формату 3+3+2 или 3+2+2."""
+    return normalize_primary_plate(raw_text) is not None

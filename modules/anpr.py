@@ -12,7 +12,10 @@ import numpy as np
 from ultralytics import YOLO
 
 from modules.ocr import PlateOCR
-from limitations.plate_rules import normalize_plate   # <<< вот это добавляем
+from limitations.plate_rules import (
+    normalize_plate,
+    normalize_primary_plate,
+)
 
 
 
@@ -79,6 +82,23 @@ def preprocess_plate(img: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     cv2.imwrite("debug_proc_crop.jpg", proc)
 
     return proc, clahe_bgr
+
+
+def _select_best_valid_plate(trials: list[tuple[str, str, Optional[str], float]]) -> tuple[Optional[str], float]:
+    """
+    trials: [(variant, raw, normalized_or_none, ocr_conf), ...]
+    Выбираем валидный (по формату KZ) номер с максимальной ocr_conf.
+    Если валидных нет — возвращаем (None, 0.0), чтобы не перебивать номер камеры.
+    """
+    best_plate = None
+    best_conf = 0.0
+    for _, _, norm_plate, ocr_conf in trials:
+        if norm_plate is None:
+            continue
+        if best_plate is None or ocr_conf > best_conf:
+            best_plate = norm_plate
+            best_conf = ocr_conf
+    return best_plate, best_conf
 
 
 class ANPR:
@@ -173,33 +193,23 @@ class ANPR:
 
         for variant_name, crop in (("clahe", clahe_crop), ("binary", proc_crop)):
             raw_plate, ocr_conf = self.ocr.recognize(crop)
-            normalized_plate = normalize_plate(raw_plate)
+            strict_plate = normalize_primary_plate(raw_plate)
+            relaxed_plate = normalize_plate(raw_plate)  # для логов
 
             # 👉 ЛОГИРУЕМ каждый вариант
             print(
                 f"[ANPR][{variant_name}] "
-                f"raw='{raw_plate}' norm='{normalized_plate}' "
+                f"raw='{raw_plate}' norm_relaxed='{relaxed_plate}' "
+                f"norm_strict='{strict_plate}' "
                 f"ocr_conf={ocr_conf:.3f} det_conf={det_conf:.3f} "
                 f"bbox=({x1},{y1},{x2},{y2})"
             )
 
-            ocr_trials.append((variant_name, raw_plate, normalized_plate, ocr_conf))
+            ocr_trials.append((variant_name, raw_plate, strict_plate, ocr_conf))
 
-        best_norm = None
-        best_conf = 0.0
-        for _, _, normalized_plate, ocr_conf in ocr_trials:
-            if normalized_plate is None:
-                continue
-            if normalized_plate == best_norm:
-                best_conf = max(best_conf, ocr_conf)
-            elif ocr_conf > best_conf:
-                best_norm = normalized_plate
-                best_conf = ocr_conf
-
-        plate_final = best_norm  # None ???? ?????? ?????????
-        ocr_conf_final = best_conf if best_norm is not None else max(
-            (conf for _, _, _, conf in ocr_trials), default=0.0
-        )
+        # Выбираем только валидные по строгому формату. Если нет валидных — вернем None,
+        # чтобы не перебивать номер, присланный камерой.
+        plate_final, ocr_conf_final = _select_best_valid_plate(ocr_trials)
 
         result = DetectionResult(
             plate=plate_final,

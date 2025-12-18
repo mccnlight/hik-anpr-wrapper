@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 
 from modules.anpr import ANPR
 from combined_merger import init_merger
+from limitations.plate_rules import normalize_primary_plate
 
 app = FastAPI(
     title="Hikvision ANPR Wrapper",
@@ -31,6 +32,8 @@ PLATE_CAMERA_ID = os.getenv("PLATE_CAMERA_ID", "camera-001")
 MERGE_WINDOW_SECONDS = int(os.getenv("MERGE_WINDOW_SECONDS", "120"))
 MERGE_TTL_SECONDS = int(os.getenv("MERGE_TTL_SECONDS", "180"))
 ENABLE_SNOW_WORKER = os.getenv("ENABLE_SNOW_WORKER", "false").lower() == "true"
+VEHICLE_CHECK_URL = os.getenv("VEHICLE_CHECK_URL")  # опционально: GET ?plate=KZ123ABC -> 200 если есть
+VEHICLE_CHECK_TOKEN = os.getenv("VEHICLE_CHECK_TOKEN", "")
 
 merger = init_merger(
     upstream_url=UPSTREAM_URL,
@@ -181,6 +184,64 @@ def parse_anpr_xml(xml_bytes: bytes) -> Dict[str, Any]:
         result["lane"] = lane
     
     return result
+
+
+# === Дополнительная проверка номера по БД (опционально) ===
+async def check_vehicle_exists(normalized_plate: str) -> Optional[bool]:
+    """
+    Возвращает True/False если удалось проверить, None если проверка отключена или упала.
+    Ожидается эндпоинт VEHICLE_CHECK_URL, принимающий query ?plate=... и отдающий 2xx если номер найден.
+    """
+    if not VEHICLE_CHECK_URL or not normalized_plate:
+        return None
+
+    try:
+        headers = {}
+        if VEHICLE_CHECK_TOKEN:
+            headers["Authorization"] = f"Bearer {VEHICLE_CHECK_TOKEN}"
+
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(VEHICLE_CHECK_URL, params={"plate": normalized_plate}, headers=headers)
+            print(f"[VEHICLE_CHECK] plate={normalized_plate} status={resp.status_code}")
+            if resp.status_code >= 500:
+                return None
+            return resp.status_code < 300
+    except Exception as e:
+        print(f"[VEHICLE_CHECK] failed for plate={normalized_plate}: {e}")
+        return None
+
+
+async def choose_plate(camera_plate: str | None, model_plate: str | None) -> tuple[Optional[str], str]:
+    """
+    Приоритет: валидный номер камеры → валидный номер модели.
+    Если включена VEHICLE_CHECK_URL, пытаемся подтвердить существование в базе.
+    Возвращает (plate_or_none, reason).
+    """
+    cam_norm = normalize_primary_plate(camera_plate) if camera_plate else None
+    model_norm = normalize_primary_plate(model_plate) if model_plate else None
+
+    # Сначала камера: если валидна и подтверждена БД — берем сразу
+    if cam_norm:
+        exists = await check_vehicle_exists(cam_norm)
+        if exists is True:
+            return cam_norm, "camera_valid_db_match"
+        if exists is None:
+            # проверка недоступна — берем валидную камеру
+            return cam_norm, "camera_valid_no_db"
+        # exists False — попробуем модель
+
+    if model_norm:
+        exists = await check_vehicle_exists(model_norm)
+        if exists is True:
+            return model_norm, "model_valid_db_match"
+        if exists is None and cam_norm is None:
+            return model_norm, "model_valid_no_db"
+
+    if cam_norm:
+        return cam_norm, "camera_valid_fallback"
+    if model_norm:
+        return model_norm, "model_valid_fallback"
+    return None, "no_valid_plate"
 
 
 # === Отправка события и фотографий на внешний сервис ===
@@ -399,40 +460,44 @@ async def hikvision_isapi(request: Request):
         else:
             event_time = now_iso
 
-        # основной номер события для поля plate (обязателен для бэкенда)
-        main_plate = model_plate or camera_plate
-        # Нормализуем: если модель пустая, пытаемся нормализовать номер камеры
-        if not model_plate and camera_plate:
-            norm_cam = camera_plate.strip() if camera_plate else None
-            main_plate = norm_cam
-        
-        # Логируем итоговый номер, который будет использован (даже если не в вайт-листе)
-        if main_plate:
-            print(f"[HIK] FINAL PLATE: '{main_plate}' (camera_plate='{camera_plate}', model_plate='{model_plate}')")
+        # Выбираем основной номер: камера приоритетна, модель — только если валидна.
+        main_plate, plate_reason = await choose_plate(camera_plate, model_plate)
+        print(
+            f"[HIK] PLATE CHOICE: main='{main_plate}' reason='{plate_reason}' "
+            f"(camera='{camera_plate}', model='{model_plate}')"
+        )
 
         # Проверка: есть ли anpr.xml от камеры
         has_anpr_xml = camera_xml_path is not None
-        
-        # Проверка: есть ли нормальный номер (не None и не пустая строка)
-        has_valid_plate = main_plate and main_plate.strip() and main_plate != "unknown"
-        
-        # Проверка уверенности: если модель не дала номер, доверяем камере при conf>=0.9
+
+        # Проверка валидности номера (строгий формат)
+        has_valid_plate = bool(main_plate)
+
+        # Проверка уверенности:
+        # - если берем камеру (reason содержит "camera"), полагаемся на camera_conf >= 0.9
+        # - если берем модель, требуем det_conf >= 0.3 и ocr_conf >= 0.5
+        plate_from_camera = plate_reason.startswith("camera") and camera_conf is not None
+        plate_from_model = plate_reason.startswith("model")
+
         has_valid_confidence = False
-        if model_det_conf is not None and model_ocr_conf is not None:
-            has_valid_confidence = (model_det_conf >= 0.3 and model_ocr_conf >= 0.5) or (camera_conf is not None and camera_conf >= 0.9)
-        elif camera_conf is not None:
-            has_valid_confidence = camera_conf >= 0.9
-        
-        # Если нет anpr.xml И (нет нормального номера ИЛИ нет достаточной уверенности) - не отправляем событие
-        # Это предотвращает отправку событий с плохо распознанными номерами
-        if not has_anpr_xml and (not has_valid_plate or not has_valid_confidence):
-            print(f"[HIK] SKIPPING EVENT: no anpr.xml, plate='{main_plate}', det_conf={model_det_conf}, ocr_conf={model_ocr_conf}, camera_conf={camera_conf}")
-            # Логируем пропущенное событие
+        if plate_from_camera:
+            has_valid_confidence = camera_conf >= 0.9 if camera_conf is not None else False
+        elif plate_from_model:
+            if model_det_conf is not None and model_ocr_conf is not None:
+                has_valid_confidence = model_det_conf >= 0.3 and model_ocr_conf >= 0.5
+
+        # Если нет валидного номера или уверенности — не отправляем
+        if not has_valid_plate or not has_valid_confidence:
+            print(
+                f"[HIK] SKIPPING EVENT: plate='{main_plate}' reason='{plate_reason}' "
+                f"det_conf={model_det_conf} ocr_conf={model_ocr_conf} camera_conf={camera_conf}"
+            )
             log_event = {
                 "timestamp": now_iso,
-                "kind": "skipped_no_valid_data",
+                "kind": "skipped_invalid_or_low_conf",
                 "has_anpr_xml": has_anpr_xml,
                 "plate": main_plate,
+                "plate_reason": plate_reason,
                 "model_plate": model_plate,
                 "camera_plate": camera_plate,
                 "model_det_conf": model_det_conf,
@@ -440,43 +505,25 @@ async def hikvision_isapi(request: Request):
                 "camera_conf": camera_conf,
                 "upstream_sent": False,
                 "upstream_status": None,
-                "upstream_error": "skipped: no valid plate and low confidence",
+                "upstream_error": "skipped: invalid format or low confidence",
             }
             log_path = BASE_DIR / "detections.log"
             with log_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(log_event, ensure_ascii=False) + "\n")
             return JSONResponse({"status": "ok"})
-        
-        # Если есть anpr.xml, но (нет нормального номера ИЛИ низкая уверенность) - не отправляем
-        # Это предотвращает отправку событий с плохо распознанными номерами даже если есть anpr.xml
-        # Если есть anpr.xml, но нет валидного номера — не шлём (пустой номер)
-        if has_anpr_xml and not has_valid_plate:
-            print(f"[HIK] SKIPPING EVENT: anpr.xml exists but plate='{main_plate}' is invalid/empty (camera_conf={camera_conf}, model_det_conf={model_det_conf}, ocr_conf={model_ocr_conf})")
-            log_event = {
-                "timestamp": now_iso,
-                "kind": "skipped_empty_plate",
-                "has_anpr_xml": has_anpr_xml,
-                "plate": main_plate,
-                "model_plate": model_plate,
-                "camera_plate": camera_plate,
-                "model_det_conf": model_det_conf,
-                "model_ocr_conf": model_ocr_conf,
-                "camera_conf": camera_conf,
-                "upstream_sent": False,
-                "upstream_status": None,
-                "upstream_error": "skipped: empty/invalid plate",
-            }
-            log_path = BASE_DIR / "detections.log"
-            with log_path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(log_event, ensure_ascii=False) + "\n")
-            return JSONResponse({"status": "ok"})
+
+        effective_conf = 0.0
+        if plate_from_camera and camera_conf is not None:
+            effective_conf = float(camera_conf)
+        elif plate_from_model and model_ocr_conf is not None:
+            effective_conf = float(model_ocr_conf)
 
         event_data: Dict[str, Any] = {
             # контракт бэкенда (обязательные поля)
             "camera_id": PLATE_CAMERA_ID,  # можно сконфигурировать через env
             "event_time": event_time,  # RFC3339 формат с timezone
             "plate": main_plate,
-            "confidence": float(camera_conf) if camera_conf is not None else 0.0,  # обязательное поле
+            "confidence": effective_conf,  # обязательное поле
             "direction": camera_info.get("direction", "unknown"),  # обязательное поле
             "lane": int(camera_info.get("lane", 0)),  # обязательное поле
             "vehicle": {},  # обязательное поле (пустой объект если нет данных)
@@ -487,6 +534,7 @@ async def hikvision_isapi(request: Request):
             "model_plate": model_plate,
             "model_det_conf": model_det_conf,
             "model_ocr_conf": model_ocr_conf,
+            "plate_source": plate_reason,
             "xml_event_type": camera_info.get("event_type"),  # тип события из anpr.xml
 
             # доп. служебное время
