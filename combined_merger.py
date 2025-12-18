@@ -7,7 +7,7 @@ import asyncio  # нужен для ожидания снеговых событ
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Deque, Dict, Optional
+from typing import Any, Deque, Dict, Optional, Tuple
 
 import httpx
 from google import genai
@@ -111,6 +111,15 @@ class EventMerger:
         self._gemini_client: genai.Client | None = None
         self._gemini_api_key = os.getenv("GEMINI_API_KEY", "")
         self._gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        # Отметки обработанных ANPR, чтобы не запускать Gemini повторно при дубликатах
+        # key: (plate, event_time_iso) -> stored_time
+        self._processed_anpr: Dict[Tuple[str, str], datetime] = {}
+        # Опциональная проверка whitelist перед Gemini
+        self._vehicle_check_url = os.getenv(
+            "MERGER_VEHICLE_CHECK_URL",
+            "https://snowops-anpr-service.onrender.com/internal/vehicles/check",
+        )
+        self._vehicle_check_token = os.getenv("MERGER_VEHICLE_CHECK_TOKEN", "")
         self._stop_cleanup = threading.Event()
         self._cleanup_thread = threading.Thread(
             target=self._cleanup_loop, daemon=True, name="merger-cleanup"
@@ -145,6 +154,16 @@ class EventMerger:
                 break
         if removed_anpr > 0:
             print(f"[MERGER] cleaned up {removed_anpr} old ANPR events (age > TTL)")
+
+        # Очистка processed меток
+        removed_processed = 0
+        ttl_seconds = self.ttl.total_seconds()
+        for key, ts in list(self._processed_anpr.items()):
+            if (now - ts).total_seconds() > ttl_seconds:
+                del self._processed_anpr[key]
+                removed_processed += 1
+        if removed_processed > 0:
+            print(f"[MERGER] cleaned up {removed_processed} processed ANPR marks (age > TTL)")
 
     def add_snow_event(self, payload: Dict[str, Any], photo_bytes: bytes | None) -> None:
         event_time_str = str(payload.get("event_time", ""))
@@ -191,6 +210,12 @@ class EventMerger:
             f"[MERGER] stored snow event at {event_time.isoformat()}, "
             f"queue size={len(self._snow_events)}"
         )
+
+    def _is_processed(self, plate: str, event_time_iso: str) -> bool:
+        return (plate, event_time_iso) in self._processed_anpr
+
+    def _mark_processed(self, plate: str, event_time_iso: str, ts: datetime) -> None:
+        self._processed_anpr[(plate, event_time_iso)] = ts
 
     def _pop_anpr_match(self, snow_time: datetime) -> Optional[ANPREvent]:
         """
@@ -384,6 +409,26 @@ class EventMerger:
             self._gemini_client = genai.Client(api_key=self._gemini_api_key)
         return self._gemini_client
 
+    async def _check_vehicle_exists(self, plate: str) -> Optional[bool]:
+        """
+        Быстрая проверка whitelist по HTTP, чтобы не дергать Gemini для несуществующих машин.
+        Ожидается 2xx, если машина найдена; 404/403 — нет; 5xx — считаем недоступно (None).
+        """
+        if not self._vehicle_check_url or not plate:
+            return None
+        try:
+            headers = {}
+            if self._vehicle_check_token:
+                headers["Authorization"] = f"Bearer {self._vehicle_check_token}"
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(self._vehicle_check_url, params={"plate": plate}, headers=headers)
+                if resp.status_code >= 500:
+                    return None
+                return resp.status_code < 300
+        except Exception as e:
+            print(f"[MERGER] vehicle check failed for plate={plate}: {e}")
+            return None
+
     def _analyze_snow_gemini(
         self, photo_bytes: bytes, bbox: Optional[Any]
     ) -> Dict[str, Any]:
@@ -547,6 +592,7 @@ class EventMerger:
         now = _now()
         anpr_time_str = str(anpr_event.get("event_time", ""))
         anpr_time = _parse_iso_dt(anpr_time_str) or now
+        plate = str(anpr_event.get("plate") or "")
         
         # Логируем разницу между временем ANPR и текущим временем для диагностики
         anpr_time_diff = (now - anpr_time).total_seconds()
@@ -607,7 +653,7 @@ class EventMerger:
                     print(f"[MERGER] still waiting for snow match (elapsed={elapsed:.1f}s, remaining={remaining:.1f}s, queue_size={queue_size_before})")
         
         # Если снег так и не найден, ANPR событие уже в очереди, просто отправляем без снега
-        return await self._combine_and_send_internal(anpr_event, detection_bytes, feature_bytes, license_bytes, snow_event)
+        return await self._combine_and_send_internal(anpr_event, detection_bytes, feature_bytes, license_bytes, snow_event, anpr_time)
 
     async def _combine_and_send_internal(
         self,
@@ -616,6 +662,7 @@ class EventMerger:
         feature_bytes: bytes | None,
         license_bytes: bytes | None,
         snow_event: Optional[SnowEvent],
+        anpr_time: Optional[datetime] = None,
     ) -> Dict[str, Any]:
         """
         Внутренний метод для объединения и отправки событий.
@@ -623,9 +670,30 @@ class EventMerger:
         combined_event = dict(anpr_event)
         snow_analysis = None
 
+        plate = str(anpr_event.get("plate") or "")
+        event_time_iso = str(anpr_event.get("event_time") or "")
+        now = _now()
+
+        if self._is_processed(plate, event_time_iso):
+            print(f"[MERGER] SKIP duplicate send: plate={plate}, event_time={event_time_iso}")
+            return {"sent": False, "status": None, "error": "duplicate_anpr_already_processed"}
+
+        # Помечаем, чтобы второй проход (snow->ANPR или ANPR->snow) не запускал Gemini/отправку повторно
+        self._mark_processed(plate, event_time_iso, now)
+
         if snow_event:
             # Отложенный анализ: вызываем Gemini только когда есть матч с номером
-            if snow_event.photo_bytes and self._gemini_api_key:
+            run_gemini = snow_event.photo_bytes and self._gemini_api_key
+
+            # Если требуется проверка whitelist, делаем её перед Gemini
+            vehicle_exists = None
+            if self._vehicle_check_url:
+                vehicle_exists = await self._check_vehicle_exists(plate)
+                if vehicle_exists is False:
+                    print(f"[MERGER] whitelist check failed, skip Gemini: plate={plate}")
+                    run_gemini = False
+
+            if run_gemini:
                 print(f"[MERGER] Running Gemini analysis for matched snow event (photo_size={len(snow_event.photo_bytes)} bytes, bbox={snow_event.payload.get('bbox')})...")
                 snow_analysis = self._analyze_snow_gemini(
                     snow_event.photo_bytes, snow_event.payload.get("bbox")
@@ -638,6 +706,8 @@ class EventMerger:
                     print("[MERGER] WARNING: snow_event.photo_bytes is None or empty")
                 if not self._gemini_api_key:
                     print("[MERGER] WARNING: GEMINI_API_KEY is not set")
+                if self._vehicle_check_url and vehicle_exists is False:
+                    print("[MERGER] INFO: vehicle not in whitelist, skipping Gemini and snow fields")
                 percentage, confidence = 0.0, 0.0
 
             combined_event.update(

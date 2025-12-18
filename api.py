@@ -481,7 +481,12 @@ async def hikvision_isapi(request: Request):
 
         has_valid_confidence = False
         if plate_from_camera:
-            has_valid_confidence = camera_conf >= 0.9 if camera_conf is not None else False
+            # Снижаем порог доверия камеры: 0.75 достаточно, если формат валиден.
+            # Если конфиденс отсутствует, но формат валиден — считаем пригодным.
+            if camera_conf is None:
+                has_valid_confidence = True
+            else:
+                has_valid_confidence = camera_conf >= 0.75
         elif plate_from_model:
             if model_det_conf is not None and model_ocr_conf is not None:
                 has_valid_confidence = model_det_conf >= 0.3 and model_ocr_conf >= 0.5
