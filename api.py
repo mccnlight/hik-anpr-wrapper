@@ -5,6 +5,7 @@ import datetime
 import json
 import xml.etree.ElementTree as ET
 import uuid
+import asyncio
 
 import cv2
 import numpy as np
@@ -15,12 +16,28 @@ from fastapi.responses import JSONResponse
 from modules.anpr import ANPR
 from combined_merger import init_merger
 from limitations.plate_rules import normalize_primary_plate
+import threading
+import time
 
 app = FastAPI(
     title="Hikvision ANPR Wrapper",
     description="HTTP API для распознавания гос-номеров по кадру камеры",
     version="1.0.0",
 )
+
+# Дедупликация по номеру от камеры: храним множество обработанных номеров с временными метками
+_processed_plates: Dict[str, float] = {}  # plate -> timestamp
+_processed_plates_lock = threading.Lock()
+DEDUP_WINDOW_SECONDS = 30.0  # Окно дедупликации: 30 секунд
+
+# Очередь обработки событий для параллельной обработки нескольких машин
+_event_queue: asyncio.Queue | None = None
+_queue_workers_started = False
+
+# Очередь обработки событий для параллельной обработки нескольких машин
+_event_queue: asyncio.Queue = None
+_queue_workers_started = False
+_queue_workers_lock = threading.Lock()
 
 # Middleware для логирования всех входящих запросов
 @app.middleware("http")
@@ -69,8 +86,41 @@ def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
+async def _event_queue_worker(worker_name: str):
+    """Воркер для обработки событий из очереди"""
+    global _event_queue
+    while True:
+        try:
+            # Получаем событие из очереди (блокируем, пока не появится событие)
+            if _event_queue is None:
+                await asyncio.sleep(0.1)
+                continue
+                
+            task_data = await _event_queue.get()
+            if task_data is None:  # Сигнал остановки
+                break
+            
+            # Обрабатываем событие
+            await _process_event_background(**task_data)
+            
+            # Помечаем задачу как выполненную
+            _event_queue.task_done()
+        except Exception:
+            # Тихая обработка ошибок в воркере
+            pass
+
 @app.on_event("startup")
 async def start_background_workers():
+    global _event_queue, _queue_workers_started
+    
+    # Создаем очередь обработки событий
+    _event_queue = asyncio.Queue(maxsize=100)
+    
+    # Запускаем воркеры для обработки очереди (3 параллельных воркера)
+    for i in range(3):
+        asyncio.create_task(_event_queue_worker(f"worker-{i+1}"))
+    _queue_workers_started = True
+    
     if ENABLE_SNOW_WORKER:
         from snow_worker import start_snow_worker, SNOW_VIDEO_SOURCE_URL
 
@@ -383,6 +433,85 @@ async def send_to_upstream(
         }
 
 
+# === Фоновая обработка события ===
+
+async def _process_event_background(
+    event_data: Dict[str, Any],
+    detection_bytes: bytes | None,
+    feature_bytes: bytes | None,
+    license_bytes: bytes | None,
+    snow_photo_bytes: bytes | None,
+    plate_photo_1: bytes | None,
+    plate_photo_2: bytes | None,
+    camera_plate_for_gemini: str | None,
+    main_plate: str | None,
+    merger: Any,
+) -> None:
+    """
+    Фоновая обработка события: Gemini анализ, формирование данных, отправка на upstream.
+    Выполняется асинхронно после отправки ответа камере. Без логирования для скорости.
+    """
+    try:
+        # 1. Вызываем Gemini для анализа (если есть снег и хотя бы одно фото номера)
+        gemini_result = None
+        if snow_photo_bytes and plate_photo_1:
+            try:
+                gemini_result = await merger.analyze_with_gemini(
+                    snow_photo=snow_photo_bytes,
+                    plate_photo_1=plate_photo_1,
+                    plate_photo_2=plate_photo_2,
+                    camera_plate=camera_plate_for_gemini,
+                )
+            except Exception:
+                gemini_result = {"error": "gemini_failed"}
+        
+        # 2. Используем результаты от Gemini
+        final_plate = main_plate
+        if gemini_result and gemini_result.get("plate"):
+            final_plate = gemini_result.get("plate")
+        
+        event_data["plate"] = final_plate
+        
+        # Процент снега и confidence от Gemini
+        snow_percentage = 0.0
+        snow_confidence = 0.0
+        if gemini_result:
+            snow_percentage = gemini_result.get("snow_percentage", 0.0)
+            snow_confidence = gemini_result.get("snow_confidence", 0.0)
+        
+        event_data["snow_volume_percentage"] = snow_percentage
+        event_data["snow_volume_confidence"] = snow_confidence
+        event_data["matched_snow"] = snow_photo_bytes is not None
+        
+        if gemini_result:
+            event_data["gemini_result"] = gemini_result
+        
+        # 3. Отправляем на upstream со всеми фотографиями
+        upstream_result = await send_to_upstream(
+            event_data=event_data,
+            detection_bytes=detection_bytes,
+            feature_bytes=feature_bytes,
+            license_bytes=license_bytes,
+            snow_bytes=snow_photo_bytes,
+        )
+        
+        # 4. Логируем в detections.log (тихо, без print)
+        log_event = {
+            **event_data,
+            "upstream_sent": upstream_result["sent"],
+            "upstream_status": upstream_result["status"],
+            "upstream_error": upstream_result["error"],
+            "snow_photo_captured": snow_photo_bytes is not None,
+        }
+        
+        log_path = BASE_DIR / "detections.log"
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(log_event, ensure_ascii=False) + "\n")
+    except Exception:
+        # Тихая обработка ошибок в фоне
+        pass
+
+
 # === Основной хендлер для Hikvision ANPR ===
 
 @app.post("/api/v1/anpr/hikvision")
@@ -396,6 +525,16 @@ async def hikvision_isapi(request: Request):
     print("=== HIKVISION REQUEST HEADERS ===")
     for k, v in headers.items():
         print(f"{k}: {v}")
+
+    # КРИТИЧНО: Захватываем фото снега СРАЗУ, до всех остальных операций
+    # Это должно быть первым действием, чтобы получить кадр в нужный момент
+    snow_photo_bytes = None
+    if ENABLE_SNOW_WORKER:
+        try:
+            from snow_worker import capture_snow_photo
+            snow_photo_bytes = capture_snow_photo()
+        except Exception:
+            pass
 
     body = await request.body()
     content_type = headers.get("content-type", "")
@@ -647,30 +786,34 @@ async def hikvision_isapi(request: Request):
         
         # === НОВАЯ ЛОГИКА: захват снега и анализ через Gemini ===
         
+        # 0. Проверка дедупликации по номеру от камеры (быстрая проверка)
+        current_time_float = time.time()
+        camera_plate_for_dedup = camera_plate or main_plate
+        
+        if camera_plate_for_dedup:
+            with _processed_plates_lock:
+                # Быстрая очистка старых записей
+                plates_to_remove = [
+                    plate for plate, ts in _processed_plates.items()
+                    if current_time_float - ts > DEDUP_WINDOW_SECONDS
+                ]
+                for plate in plates_to_remove:
+                    del _processed_plates[plate]
+                
+                # Проверяем дубликат
+                if camera_plate_for_dedup in _processed_plates:
+                    return JSONResponse({"status": "ok", "reason": "duplicate"})
+                
+                # Помечаем как обработанный
+                _processed_plates[camera_plate_for_dedup] = current_time_float
+        
         # 1. Генерируем event_id для связывания всех фотографий
         event_id = str(uuid.uuid4())
         event_data["event_id"] = event_id
-        print(f"[HIK] Generated event_id: {event_id}")
         
-        # 2. Захватываем фото снега с задержкой
-        snow_photo_bytes = None
-        if ENABLE_SNOW_WORKER:
-            try:
-                from snow_worker import capture_snow_photo, SNOW_CAPTURE_DELAY_SECONDS
-                print(f"[HIK] Requesting snow photo capture with delay={SNOW_CAPTURE_DELAY_SECONDS}s...")
-                snow_photo_bytes = capture_snow_photo(SNOW_CAPTURE_DELAY_SECONDS)
-                if snow_photo_bytes:
-                    print(f"[HIK] ✅ Snow photo captured, size={len(snow_photo_bytes)} bytes")
-                else:
-                    print(f"[HIK] ⚠️ WARNING: Failed to capture snow photo (buffer may be empty or delay too large)")
-            except Exception as e:
-                print(f"[HIK] ❌ ERROR capturing snow photo: {e}")
-                import traceback
-                print(f"[HIK] Traceback: {traceback.format_exc()}")
-        else:
-            print(f"[HIK] Snow worker disabled, skipping snow photo capture")
+        # 2. Фото снега уже захвачено в начале функции (до всех операций)
         
-        # 3. Выбираем 2 лучшие фото номеров для Gemini
+        # 3. Выбираем 2 лучшие фото номеров для Gemini (для фоновой обработки)
         # Приоритет: detection (всегда), затем feature или license (лучшая по размеру)
         plate_photo_1 = detection_bytes  # Всегда используем detection
         plate_photo_2 = None
@@ -686,85 +829,35 @@ async def hikvision_isapi(request: Request):
         elif license_bytes:
             plate_photo_2 = license_bytes
         
-        print(f"[HIK] Selected photos for Gemini: plate_1={'present' if plate_photo_1 else 'none'}, "
-              f"plate_2={'present' if plate_photo_2 else 'none'}, "
-              f"snow={'present' if snow_photo_bytes else 'none'}")
+        # 4. Добавляем событие в очередь для фоновой обработки
+        camera_plate_for_gemini = camera_plate or main_plate
         
-        # 4. Вызываем Gemini для анализа (если есть снег и хотя бы одно фото номера)
-        gemini_result = None
-        if snow_photo_bytes and plate_photo_1:
-            try:
-                print(f"[HIK] Calling Gemini for analysis...")
-                gemini_result = await merger.analyze_with_gemini(
-                    snow_photo=snow_photo_bytes,
-                    plate_photo_1=plate_photo_1,
-                    plate_photo_2=plate_photo_2,
-                )
-                print(f"[HIK] Gemini result: {gemini_result}")
-            except Exception as e:
-                print(f"[HIK] ERROR calling Gemini: {e}")
-                import traceback
-                print(f"[HIK] Traceback: {traceback.format_exc()}")
-                gemini_result = {"error": str(e)}
-        
-        # 5. Используем результаты от Gemini
-        # Номер: от Gemini, если распознан, иначе от камеры/модели
-        final_plate = main_plate
-        if gemini_result and gemini_result.get("plate"):
-            final_plate = gemini_result.get("plate")
-            print(f"[HIK] Using plate from Gemini: '{final_plate}'")
-        else:
-            print(f"[HIK] Using plate from camera/model: '{final_plate}'")
-        
-        event_data["plate"] = final_plate
-        
-        # Процент снега и confidence от Gemini
-        snow_percentage = 0.0
-        snow_confidence = 0.0
-        if gemini_result:
-            snow_percentage = gemini_result.get("snow_percentage", 0.0)
-            snow_confidence = gemini_result.get("snow_confidence", 0.0)
-            if "error" in gemini_result:
-                print(f"[HIK] WARNING: Gemini returned error: {gemini_result.get('error')}")
-        
-        event_data["snow_volume_percentage"] = snow_percentage
-        event_data["snow_volume_confidence"] = snow_confidence
+        # Устанавливаем начальные значения в event_data (будут обновлены в фоне)
+        event_data["plate"] = main_plate
+        event_data["snow_volume_percentage"] = 0.0
+        event_data["snow_volume_confidence"] = 0.0
         event_data["matched_snow"] = snow_photo_bytes is not None
         
-        # Добавляем данные от Gemini в event_data для логирования
-        if gemini_result:
-            event_data["gemini_result"] = gemini_result
+        # Добавляем в очередь (не блокируем, если очередь полна - просто пропускаем)
+        if _event_queue is not None:
+            try:
+                _event_queue.put_nowait({
+                    "event_data": event_data,
+                    "detection_bytes": detection_bytes,
+                    "feature_bytes": feature_bytes,
+                    "license_bytes": license_bytes,
+                    "snow_photo_bytes": snow_photo_bytes,
+                    "plate_photo_1": plate_photo_1,
+                    "plate_photo_2": plate_photo_2,
+                    "camera_plate_for_gemini": camera_plate_for_gemini,
+                    "main_plate": main_plate,
+                    "merger": merger,
+                })
+            except asyncio.QueueFull:
+                # Очередь переполнена - пропускаем обработку
+                pass
         
-        # 6. Отправляем на upstream со всеми фотографиями
-        print(f"[HIK] 📤 Sending event to upstream: plate='{final_plate}', event_id={event_id}")
-        upstream_result = await send_to_upstream(
-            event_data=event_data,
-            detection_bytes=detection_bytes,
-            feature_bytes=feature_bytes,
-            license_bytes=license_bytes,
-            snow_bytes=snow_photo_bytes,  # Добавляем фото снега
-        )
-
-        # 7. Логируем в detections.log
-        log_event = {
-            **event_data,
-            "upstream_sent": upstream_result["sent"],
-            "upstream_status": upstream_result["status"],
-            "upstream_error": upstream_result["error"],
-            "snow_photo_captured": snow_photo_bytes is not None,
-        }
-
-        log_path = BASE_DIR / "detections.log"
-        with log_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(log_event, ensure_ascii=False) + "\n")
-
-        if upstream_result["sent"]:
-            print(f"[HIK] ✅ Event sent successfully to upstream (status={upstream_result['status']})")
-        else:
-            print(f"[HIK] ❌ Failed to send event to upstream: {upstream_result.get('error')}")
-
-        # 8) Ответ камере — просто "ok"
-        print(f"[HIK] === EVENT PROCESSING COMPLETE ===\n")
+        # 5. Моментальный ответ камере (не ждем обработки)
         return JSONResponse({"status": "ok"})
 
     # === ВАРИАНТ 2: fallback — ищем JPEG прямо в body (редкий случай) ===
@@ -860,54 +953,48 @@ async def hikvision_isapi(request: Request):
 
     # === НОВАЯ ЛОГИКА для fallback варианта ===
     
+    # 0. Проверка дедупликации по номеру от модели (в fallback нет camera_plate)
+    current_time_float = time.time()
+    plate_for_dedup = main_plate
+    
+    if plate_for_dedup:
+        with _processed_plates_lock:
+            # Очищаем старые записи
+            plates_to_remove = [
+                plate for plate, ts in _processed_plates.items()
+                if current_time_float - ts > DEDUP_WINDOW_SECONDS
+            ]
+            for plate in plates_to_remove:
+                del _processed_plates[plate]
+            
+            # Проверяем, не был ли уже обработан этот номер
+            if plate_for_dedup in _processed_plates:
+                last_time = _processed_plates[plate_for_dedup]
+                age = current_time_float - last_time
+                print(f"[HIK] (fallback) ⚠️ DUPLICATE DETECTED: plate '{plate_for_dedup}' was processed {age:.1f}s ago, skipping")
+                return JSONResponse({"status": "ok", "reason": "duplicate"})
+            
+            # Помечаем номер как обработанный
+            _processed_plates[plate_for_dedup] = current_time_float
+            print(f"[HIK] (fallback) Plate '{plate_for_dedup}' marked as processed")
+    
     # 1. Генерируем event_id
     event_id = str(uuid.uuid4())
     
-    # 2. Захватываем фото снега
-    snow_photo_bytes = None
-    if ENABLE_SNOW_WORKER:
-        try:
-            from snow_worker import capture_snow_photo
-            print(f"[HIK] (fallback) Requesting snow photo capture...")
-            snow_photo_bytes = capture_snow_photo()
-            if snow_photo_bytes:
-                print(f"[HIK] (fallback) Snow photo captured, size={len(snow_photo_bytes)} bytes")
-        except Exception as e:
-            print(f"[HIK] (fallback) ERROR capturing snow photo: {e}")
+    # Парсим event_time для fallback (используем текущее время)
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    now_iso = now_utc.isoformat().replace('+00:00', 'Z')
+    event_time = now_iso
     
-    # 3. Вызываем Gemini (если есть снег)
-    gemini_result = None
-    if snow_photo_bytes and jpg_bytes:
-        try:
-            print(f"[HIK] (fallback) Calling Gemini for analysis...")
-            gemini_result = await merger.analyze_with_gemini(
-                snow_photo=snow_photo_bytes,
-                plate_photo_1=jpg_bytes,
-                plate_photo_2=None,
-            )
-            print(f"[HIK] (fallback) Gemini result: {gemini_result}")
-        except Exception as e:
-            print(f"[HIK] (fallback) ERROR calling Gemini: {e}")
-            gemini_result = {"error": str(e)}
+    # 2. Фото снега уже захвачено в начале функции (до всех операций)
     
-    # 4. Используем результаты от Gemini
-    final_plate = main_plate
-    if gemini_result and gemini_result.get("plate"):
-        final_plate = gemini_result.get("plate")
-        print(f"[HIK] (fallback) Using plate from Gemini: '{final_plate}'")
-    
-    snow_percentage = 0.0
-    snow_confidence = 0.0
-    if gemini_result:
-        snow_percentage = gemini_result.get("snow_percentage", 0.0)
-        snow_confidence = gemini_result.get("snow_confidence", 0.0)
-
+    # 3. Подготавливаем данные для фоновой обработки
     event_data: Dict[str, Any] = {
         # контракт бэкенда (обязательные поля)
         "camera_id": PLATE_CAMERA_ID,
         "event_time": now_iso,  # RFC3339 формат с timezone
         "event_id": event_id,
-        "plate": final_plate,
+        "plate": main_plate,  # Будет обновлено в фоне после Gemini
         "confidence": float(model_ocr_conf) if model_ocr_conf is not None else 0.0,  # обязательное поле
         "direction": "unknown",  # обязательное поле
         "lane": 0,  # обязательное поле
@@ -918,36 +1005,30 @@ async def hikvision_isapi(request: Request):
         "model_plate": model_plate,
         "model_det_conf": model_det_conf,
         "model_ocr_conf": model_ocr_conf,
-        "snow_volume_percentage": snow_percentage,
-        "snow_volume_confidence": snow_confidence,
+        "plate_source": "fallback_model",
+        "snow_volume_percentage": 0.0,  # Будет обновлено в фоне после Gemini
+        "snow_volume_confidence": 0.0,  # Будет обновлено в фоне после Gemini
         "matched_snow": snow_photo_bytes is not None,
         "timestamp": now_iso,
     }
+
+    # Добавляем в очередь для фоновой обработки
+    if _event_queue is not None:
+        try:
+            _event_queue.put_nowait({
+                "event_data": event_data,
+                "detection_bytes": jpg_bytes,
+                "feature_bytes": None,
+                "license_bytes": None,
+                "snow_photo_bytes": snow_photo_bytes,
+                "plate_photo_1": jpg_bytes,
+                "plate_photo_2": None,
+                "camera_plate_for_gemini": main_plate,
+                "main_plate": main_plate,
+                "merger": merger,
+            })
+        except asyncio.QueueFull:
+            pass
     
-    if gemini_result:
-        event_data["gemini_result"] = gemini_result
-
-    # Отправляем на upstream
-    upstream_result = await send_to_upstream(
-        event_data=event_data,
-        detection_bytes=jpg_bytes,
-        feature_bytes=None,
-        license_bytes=None,
-        snow_bytes=snow_photo_bytes,
-    )
-
-    log_event = {
-        **event_data,
-        "upstream_sent": upstream_result["sent"],
-        "upstream_status": upstream_result["status"],
-        "upstream_error": upstream_result["error"],
-        "anpr_bbox": model_bbox,
-        "snow_photo_captured": snow_photo_bytes is not None,
-    }
-
-    log_path = BASE_DIR / "detections.log"
-    with log_path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(log_event, ensure_ascii=False) + "\n")
-
-    # Ответ камере — снова просто "ok"
+    # Моментальный ответ камере (не ждем обработки)
     return JSONResponse({"status": "ok"})

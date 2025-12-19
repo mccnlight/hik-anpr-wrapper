@@ -75,41 +75,33 @@ class TimestampedFrame:
     frame: np.ndarray
     timestamp: float  # time.time()
 
-_frame_buffer: deque[TimestampedFrame] = deque(maxlen=150)  # ~5 секунд при 30 FPS
+_frame_buffer: deque[TimestampedFrame] = deque(maxlen=300)  # ~10 секунд при 30 FPS
 _frame_buffer_lock = threading.Lock()
-BUFFER_DURATION_SECONDS = 5.0  # Храним кадры за последние 5 секунд
+BUFFER_DURATION_SECONDS = 10.0  # Храним кадры за последние 10 секунд (для задержки до 9.0 сек)
 
 
 # === Функция захвата фото по запросу ===
 
-def capture_snow_photo(delay_seconds: Optional[float] = None) -> Optional[bytes]:
+def capture_snow_photo() -> Optional[bytes]:
     """
-    Захватывает кадр из буфера снеговой камеры, который был записан delay_seconds назад.
-    Это нужно потому что камера по снегу стоит раньше камеры по номерам, и когда приходит
-    событие от камеры номеров, машина уже проехала мимо снеговой камеры.
-    
-    Args:
-        delay_seconds: Сколько секунд назад был записан нужный кадр (если None, используется SNOW_CAPTURE_DELAY_SECONDS)
+    Захватывает кадр из буфера снеговой камеры, который был записан примерно 2.5-3 секунды назад.
+    Камера по снегу стоит раньше камеры по номерам, поэтому нужно брать кадр из прошлого.
     
     Returns:
         JPEG bytes кадра или None, если не удалось найти подходящий кадр
     """
     global _frame_buffer
-    
-    # Используем переданную задержку или значение из конфига
-    target_delay = delay_seconds if delay_seconds is not None else SNOW_CAPTURE_DELAY_SECONDS
+    import time
     
     current_time = time.time()
-    target_timestamp = current_time - target_delay
-    
-    print(f"[SNOW] capture_snow_photo: looking for frame from {target_delay:.2f}s ago (target_timestamp={target_timestamp:.3f}, current={current_time:.3f})")
+    target_timestamp = current_time - SNOW_CAPTURE_DELAY_SECONDS
     
     with _frame_buffer_lock:
         if len(_frame_buffer) == 0:
-            print("[SNOW] capture_snow_photo: frame buffer is empty")
+            print(f"[SNOW] capture_snow_photo: buffer is empty")
             return None
         
-        # Ищем кадр, который ближе всего к целевому времени
+        # Ищем кадр, который ближе всего к целевому времени (2.5 сек назад)
         best_frame = None
         best_delta = float('inf')
         
@@ -120,11 +112,18 @@ def capture_snow_photo(delay_seconds: Optional[float] = None) -> Optional[bytes]
                 best_frame = timestamped_frame
         
         if best_frame is None:
-            print("[SNOW] capture_snow_photo: no suitable frame found in buffer")
+            print(f"[SNOW] capture_snow_photo: no suitable frame found")
             return None
         
-        actual_delay = current_time - best_frame.timestamp
-        print(f"[SNOW] capture_snow_photo: found frame from {actual_delay:.2f}s ago (requested {target_delay:.2f}s, delta={best_delta:.3f}s)")
+        # Проверяем, что кадр не слишком старый (больше 5 секунд - уже неактуален)
+        frame_age = current_time - best_frame.timestamp
+        if frame_age > BUFFER_DURATION_SECONDS:
+            print(f"[SNOW] capture_snow_photo: frame too old ({frame_age:.2f}s > {BUFFER_DURATION_SECONDS}s)")
+            return None
+        
+        # Логируем для отладки
+        actual_delay = frame_age
+        print(f"[SNOW] capture_snow_photo: found frame from {actual_delay:.2f}s ago (requested {SNOW_CAPTURE_DELAY_SECONDS:.2f}s, delta={best_delta:.3f}s)")
         
         frame = best_frame.frame.copy()
     
@@ -132,7 +131,6 @@ def capture_snow_photo(delay_seconds: Optional[float] = None) -> Optional[bytes]
     try:
         ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
         if not ok:
-            print("[SNOW] capture_snow_photo: failed to encode frame to JPEG")
             return None
         photo_bytes = buf.tobytes()
         print(f"[SNOW] capture_snow_photo: encoded frame, size={len(photo_bytes)} bytes")
@@ -271,6 +269,7 @@ def _snow_loop(upstream_url: str):
     LOG_INTERVAL_SECONDS = 8.0  # Логируем раз в 8 секунд
 
     print(f"[SNOW] worker started (buffering mode - storing frames for {BUFFER_DURATION_SECONDS}s)")
+    
     while not _stop_event.is_set():
         with _cap_lock:
             ret, frame = _cap.read()
@@ -334,7 +333,7 @@ def _snow_loop(upstream_url: str):
 def start_snow_worker(upstream_url: str):
     """
     Запуск снегового воркера в отдельном потоке.
-    Теперь воркер только читает RTSP поток и сохраняет кадры в памяти.
+    Воркер читает RTSP поток и поддерживает его активным для мгновенного захвата кадров по запросу.
     """
     global _snow_thread
     if _snow_thread is not None:

@@ -434,12 +434,14 @@ class EventMerger:
         snow_photo: bytes,
         plate_photo_1: bytes,
         plate_photo_2: bytes | None,
+        camera_plate: str | None = None,
     ) -> Dict[str, Any]:
         """
         Анализирует 3 фотографии через Gemini:
         - snow_photo: фото снега (обязательно)
-        - plate_photo_1: первое фото номера (обязательно, обычно detectionPicture)
-        - plate_photo_2: второе фото номера (опционально, featurePicture или licensePlatePicture)
+        - plate_photo_1: первое фото номера (обязательно, обычно detectionPicture - обычная фотка)
+        - plate_photo_2: второе фото номера (опционально, featurePicture или licensePlatePicture - приближенная фотка)
+        - camera_plate: номер от камеры (может быть неверным, нужна дополнительная проверка)
         
         Возвращает:
         {
@@ -477,36 +479,61 @@ class EventMerger:
                   f"plate_image_1={plate_image_1.size}, "
                   f"plate_image_2={'present' if plate_photo_2 else 'none'}")
 
-            image3_text = "IMAGE 3: License plate photo 2 - another view of the license plate.\n" if plate_photo_2 else ""
+            image3_text = "IMAGE 3: License plate photo 2 - close-up/zoomed view of the license plate (approximated photo).\n" if plate_photo_2 else ""
+            camera_plate_text = ""
+            if camera_plate:
+                camera_plate_text = (
+                    f"\nIMPORTANT: The camera detected plate number '{camera_plate}', but this may be INCORRECT. "
+                    "You must verify and correct it by carefully reading the actual plate from the images. "
+                    "Use the camera's suggestion only as a hint, but always verify against what you see in the photos.\n"
+                )
+            
             prompt = (
                 "You are analyzing truck photos for snow volume and license plate recognition.\n\n"
                 "IMAGE 1: Snow photo - shows the cargo bed of a truck.\n"
-                "IMAGE 2: License plate photo 1 - shows the vehicle's license plate.\n"
+                "IMAGE 2: License plate photo 1 - shows the vehicle's license plate (normal/wide view).\n"
                 + image3_text +
+                camera_plate_text +
                 "\n"
+                "CRITICAL: Focus ONLY on the truck that is CLOSEST to the camera (on the nearest lane). "
+                "If there are multiple trucks in the images, analyze ONLY the one that appears largest/closest. "
+                "Ignore any trucks that are further away or in the background.\n\n"
                 "TASKS:\n"
                 "1. Analyze IMAGE 1 (snow photo):\n"
-                "   - Classify ONLY loose/bulk snow inside the OPEN cargo bed.\n"
+                "   - Identify the truck that is CLOSEST to the camera (largest in the frame, on the nearest lane).\n"
+                "   - Analyze ONLY the cargo bed of THIS nearest truck.\n"
+                "   - Classify ONLY loose/bulk snow inside the OPEN cargo bed of the nearest truck.\n"
                 "   - Exclude: painted/clean metal or plastic surfaces, tarps, roof/hood, sides of the truck,\n"
                 "     sun glare, white paint, reflections, frost/ice, road, background, or closed/covered beds.\n"
-                "   - If the bed is not clearly visible or is closed/covered/fully outside the frame, set snow_percentage=0 and snow_confidence=0.0.\n"
+                "   - If the bed of the nearest truck is not clearly visible or is closed/covered/fully outside the frame, set snow_percentage=0 and snow_confidence=0.0.\n"
                 "   - Snow must look like uneven/loose material with texture; a smooth flat surface (even if white) is NOT snow.\n"
+                "   - DO NOT analyze snow in trucks that are further away or in the background.\n"
                 "\n"
                 "2. Recognize license plate from IMAGE 2 (and IMAGE 3 if provided):\n"
-                "   - Extract the license plate number from the plate photos.\n"
-                "   - Use the clearest/most readable photo if multiple are provided.\n"
-                "   - Return the plate number in standard format (e.g., '123ABC45' for Kazakhstan plates).\n"
+                "   - Identify the truck that is CLOSEST to the camera (largest in the frame, on the nearest lane).\n"
+                "   - Extract the license plate number from THIS nearest truck ONLY.\n"
+                "   - You have TWO photos: IMAGE 2 is normal/wide view, IMAGE 3 (if provided) is close-up/zoomed view.\n"
+                "   - Use BOTH photos to get the most accurate result - the close-up (IMAGE 3) usually has better detail.\n"
+                "   - Kazakhstan license plate format is STRICT:\n"
+                "     * Format 1: 111AAA11 (3 digits, 3 letters, 2 digits) - example: 035AL115\n"
+                "     * Format 2: 111AA11 (3 digits, 2 letters, 2 digits) - example: 035AL15\n"
+                "     * Region codes: 01-18 ONLY (there is NO region 19)\n"
+                "     * Letters are Latin (A-Z), NOT Cyrillic\n"
+                "   - The plate number MUST match one of these formats exactly.\n"
+                "   - If you cannot clearly read a valid format from the nearest truck, return null for plate.\n"
+                "   - Return the plate number WITHOUT spaces, dashes, or other separators (e.g., '035AL115' not '035 AL 115').\n"
+                "   - DO NOT read plates from trucks that are further away or in the background.\n"
                 "\n"
                 "Return JSON with fields:\n"
                 "- snow_percentage: 0.0-100.0 (how full the bed is with snow, 0-100 scale)\n"
                 "- snow_confidence: 0.0-1.0 (confidence in snow analysis)\n"
-                "- plate: string or null (recognized license plate number, or null if not recognized)\n"
+                "- plate: string or null (recognized license plate number in format 111AAA11 or 111AA11, or null if not recognized)\n"
                 "- plate_confidence: 0.0-1.0 (confidence in plate recognition)\n\n"
                 "Example:\n"
                 "{\n"
                 '  "snow_percentage": 42.5,\n'
                 '  "snow_confidence": 0.9,\n'
-                '  "plate": "123ABC45",\n'
+                '  "plate": "035AL115",\n'
                 '  "plate_confidence": 0.85\n'
                 "}\n"
             )
