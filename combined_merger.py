@@ -3,6 +3,7 @@ import os
 import io
 import threading
 import time
+import hashlib
 import asyncio  # нужен для ожидания снеговых событий, если ANPR пришел раньше
 from collections import deque
 from dataclasses import dataclass
@@ -112,6 +113,10 @@ class EventMerger:
         self._gemini_api_key = os.getenv("GEMINI_API_KEY", "")
         self._gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
         # Отметки обработанных ANPR, чтобы не запускать Gemini повторно при дубликатах
+        # Кэш для дедупликации Gemini запросов (хеш фотографий -> (результат, timestamp))
+        self._gemini_cache: Dict[str, Tuple[Dict[str, Any], float]] = {}
+        self._gemini_cache_lock = threading.Lock()
+        self._gemini_cache_ttl = 300.0  # Кэш живет 5 минут
         # key: (plate, event_time_iso) -> stored_time
         self._processed_anpr: Dict[Tuple[str, str], datetime] = {}
         # Опциональная проверка whitelist перед Gemini
@@ -429,6 +434,15 @@ class EventMerger:
             print(f"[MERGER] vehicle check failed for plate={plate}: {e}")
             return None
 
+    def _get_photos_hash(self, snow_photo: bytes, plate_photo_1: bytes, plate_photo_2: bytes | None) -> str:
+        """Вычисляет хеш от фотографий для дедупликации"""
+        hash_obj = hashlib.md5()
+        hash_obj.update(snow_photo)
+        hash_obj.update(plate_photo_1)
+        if plate_photo_2:
+            hash_obj.update(plate_photo_2)
+        return hash_obj.hexdigest()
+
     async def analyze_with_gemini(
         self,
         snow_photo: bytes,
@@ -452,6 +466,25 @@ class EventMerger:
             "error": "описание ошибки если есть"
         }
         """
+        # Проверка дедупликации: вычисляем хеш от фотографий
+        photos_hash = self._get_photos_hash(snow_photo, plate_photo_1, plate_photo_2)
+        current_time = time.time()
+        
+        with self._gemini_cache_lock:
+            # Очищаем старый кэш
+            cache_keys_to_remove = [
+                key for key, (result, timestamp) in self._gemini_cache.items()
+                if current_time - timestamp > self._gemini_cache_ttl
+            ]
+            for key in cache_keys_to_remove:
+                del self._gemini_cache[key]
+            
+            # Проверяем, не обрабатывали ли мы уже эти фотографии
+            if photos_hash in self._gemini_cache:
+                cached_result, _ = self._gemini_cache[photos_hash]
+                print(f"[GEMINI] Using cached result for photos hash {photos_hash[:8]}... (duplicate request skipped)")
+                return cached_result.copy()  # Возвращаем копию, чтобы не изменять кэш
+        
         if not self._gemini_api_key:
             print("[GEMINI] ERROR: GEMINI_API_KEY is not set")
             return {
@@ -481,11 +514,17 @@ class EventMerger:
 
             image3_text = "IMAGE 3: License plate photo 2 - close-up/zoomed view of the license plate (approximated photo).\n" if plate_photo_2 else ""
             camera_plate_text = ""
-            if camera_plate:
+            if camera_plate and camera_plate.lower() not in ["unknown", "none", ""]:
                 camera_plate_text = (
                     f"\nIMPORTANT: The camera detected plate number '{camera_plate}', but this may be INCORRECT. "
                     "You must verify and correct it by carefully reading the actual plate from the images. "
                     "Use the camera's suggestion only as a hint, but always verify against what you see in the photos.\n"
+                )
+            elif camera_plate and camera_plate.lower() == "unknown":
+                camera_plate_text = (
+                    f"\nIMPORTANT: The camera could not detect a plate number (returned 'unknown'). "
+                    "You must carefully read the license plate from the images provided. "
+                    "Look at both IMAGE 2 (normal view) and IMAGE 3 (close-up view if provided) to extract the plate number.\n"
                 )
             
             prompt = (
@@ -608,12 +647,18 @@ class EventMerger:
                     if not plate or plate == "NULL" or plate == "NONE":
                         plate = None
                 
-                return {
+                result = {
                     "snow_percentage": snow_percentage,
                     "snow_confidence": snow_confidence,
                     "plate": plate,
                     "plate_confidence": plate_confidence,
                 }
+                
+                # Сохраняем результат в кэш для дедупликации
+                with self._gemini_cache_lock:
+                    self._gemini_cache[photos_hash] = (result.copy(), current_time)
+                
+                return result
             except json.JSONDecodeError as e:
                 print(f"[GEMINI] ERROR: JSON parse failed: {e}")
                 print(f"[GEMINI] Failed to parse text: {text[:500]}")
