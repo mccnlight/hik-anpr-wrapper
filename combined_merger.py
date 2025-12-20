@@ -3,6 +3,7 @@ import os
 import io
 import threading
 import time
+import hashlib
 import asyncio  # нужен для ожидания снеговых событий, если ANPR пришел раньше
 from collections import deque
 from dataclasses import dataclass
@@ -112,6 +113,10 @@ class EventMerger:
         self._gemini_api_key = os.getenv("GEMINI_API_KEY", "")
         self._gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
         # Отметки обработанных ANPR, чтобы не запускать Gemini повторно при дубликатах
+        # Кэш для дедупликации Gemini запросов (хеш фотографий -> (результат, timestamp))
+        self._gemini_cache: Dict[str, Tuple[Dict[str, Any], float]] = {}
+        self._gemini_cache_lock = threading.Lock()
+        self._gemini_cache_ttl = 300.0  # Кэш живет 5 минут
         # key: (plate, event_time_iso) -> stored_time
         self._processed_anpr: Dict[Tuple[str, str], datetime] = {}
         # Опциональная проверка whitelist перед Gemini
@@ -429,11 +434,260 @@ class EventMerger:
             print(f"[MERGER] vehicle check failed for plate={plate}: {e}")
             return None
 
+    def _get_photos_hash(self, snow_photo: bytes, plate_photo_1: bytes, plate_photo_2: bytes | None) -> str:
+        """Вычисляет хеш от фотографий для дедупликации"""
+        hash_obj = hashlib.md5()
+        hash_obj.update(snow_photo)
+        hash_obj.update(plate_photo_1)
+        if plate_photo_2:
+            hash_obj.update(plate_photo_2)
+        return hash_obj.hexdigest()
+
+    async def analyze_with_gemini(
+        self,
+        snow_photo: bytes,
+        plate_photo_1: bytes,
+        plate_photo_2: bytes | None,
+        camera_plate: str | None = None,
+    ) -> Dict[str, Any]:
+        """
+        Анализирует 3 фотографии через Gemini:
+        - snow_photo: фото снега (обязательно)
+        - plate_photo_1: первое фото номера (обязательно, обычно detectionPicture - обычная фотка)
+        - plate_photo_2: второе фото номера (опционально, featurePicture или licensePlatePicture - приближенная фотка)
+        - camera_plate: номер от камеры (может быть неверным, нужна дополнительная проверка)
+        
+        Возвращает:
+        {
+            "snow_percentage": 0.0-100.0,
+            "snow_confidence": 0.0-1.0,
+            "plate": "номер или None",
+            "plate_confidence": 0.0-1.0,
+            "error": "описание ошибки если есть"
+        }
+        """
+        # Проверка дедупликации: вычисляем хеш от фотографий
+        photos_hash = self._get_photos_hash(snow_photo, plate_photo_1, plate_photo_2)
+        current_time = time.time()
+        
+        with self._gemini_cache_lock:
+            # Очищаем старый кэш
+            cache_keys_to_remove = [
+                key for key, (result, timestamp) in self._gemini_cache.items()
+                if current_time - timestamp > self._gemini_cache_ttl
+            ]
+            for key in cache_keys_to_remove:
+                del self._gemini_cache[key]
+            
+            # Проверяем, не обрабатывали ли мы уже эти фотографии
+            if photos_hash in self._gemini_cache:
+                cached_result, _ = self._gemini_cache[photos_hash]
+                print(f"[GEMINI] Using cached result for photos hash {photos_hash[:8]}... (duplicate request skipped)")
+                return cached_result.copy()  # Возвращаем копию, чтобы не изменять кэш
+        
+        if not self._gemini_api_key:
+            print("[GEMINI] ERROR: GEMINI_API_KEY is not set")
+            return {
+                "error": "GEMINI_API_KEY is not set",
+                "snow_percentage": 0.0,
+                "snow_confidence": 0.0,
+                "plate": None,
+                "plate_confidence": 0.0,
+            }
+
+        try:
+            import time as time_module
+            start_time = time_module.time()
+            
+            # Загружаем изображения
+            snow_image = Image.open(io.BytesIO(snow_photo)).convert("RGB")
+            plate_image_1 = Image.open(io.BytesIO(plate_photo_1)).convert("RGB")
+            
+            images = [snow_image, plate_image_1]
+            if plate_photo_2:
+                plate_image_2 = Image.open(io.BytesIO(plate_photo_2)).convert("RGB")
+                images.append(plate_image_2)
+            
+            print(f"[GEMINI] Starting analysis: snow_image={snow_image.size}, "
+                  f"plate_image_1={plate_image_1.size}, "
+                  f"plate_image_2={'present' if plate_photo_2 else 'none'}")
+
+            image3_text = "IMAGE 3: License plate photo 2 - close-up/zoomed view of the license plate (approximated photo).\n" if plate_photo_2 else ""
+            camera_plate_text = ""
+            if camera_plate and camera_plate.lower() not in ["unknown", "none", ""]:
+                camera_plate_text = (
+                    f"\nIMPORTANT: The camera detected plate number '{camera_plate}', but this may be INCORRECT. "
+                    "You must verify and correct it by carefully reading the actual plate from the images. "
+                    "Use the camera's suggestion only as a hint, but always verify against what you see in the photos.\n"
+                )
+            elif camera_plate and camera_plate.lower() == "unknown":
+                camera_plate_text = (
+                    f"\nIMPORTANT: The camera could not detect a plate number (returned 'unknown'). "
+                    "You must carefully read the license plate from the images provided. "
+                    "Look at both IMAGE 2 (normal view) and IMAGE 3 (close-up view if provided) to extract the plate number.\n"
+                )
+            
+            prompt = (
+                "You are analyzing truck photos for snow volume and license plate recognition.\n\n"
+                "IMAGE 1: Snow photo - shows the cargo bed of a truck.\n"
+                "IMAGE 2: License plate photo 1 - shows the vehicle's license plate (normal/wide view).\n"
+                + image3_text +
+                camera_plate_text +
+                "\n"
+                "CRITICAL: Focus ONLY on the truck that is CLOSEST to the camera (on the nearest lane). "
+                "If there are multiple trucks in the images, analyze ONLY the one that appears largest/closest. "
+                "Ignore any trucks that are further away or in the background.\n\n"
+                "TASKS:\n"
+                "1. Analyze IMAGE 1 (snow photo):\n"
+                "   - Identify the truck that is CLOSEST to the camera (largest in the frame, on the nearest lane).\n"
+                "   - Analyze ONLY the cargo bed of THIS nearest truck.\n"
+                "   - Classify ONLY loose/bulk snow inside the OPEN cargo bed of the nearest truck.\n"
+                "   - Exclude: painted/clean metal or plastic surfaces, tarps, roof/hood, sides of the truck,\n"
+                "     sun glare, white paint, reflections, frost/ice, road, background, or closed/covered beds.\n"
+                "   - If the bed of the nearest truck is not clearly visible or is closed/covered/fully outside the frame, set snow_percentage=0 and snow_confidence=0.0.\n"
+                "   - Snow must look like uneven/loose material with texture; a smooth flat surface (even if white) is NOT snow.\n"
+                "   - DO NOT analyze snow in trucks that are further away or in the background.\n"
+                "\n"
+                "2. Recognize license plate from IMAGE 2 (and IMAGE 3 if provided):\n"
+                "   - Identify the truck that is CLOSEST to the camera (largest in the frame, on the nearest lane).\n"
+                "   - Extract the license plate number from THIS nearest truck ONLY.\n"
+                "   - You have TWO photos: IMAGE 2 is normal/wide view, IMAGE 3 (if provided) is close-up/zoomed view.\n"
+                "   - Use BOTH photos to get the most accurate result - the close-up (IMAGE 3) usually has better detail.\n"
+                "   - Kazakhstan license plate format is STRICT:\n"
+                "     * Format 1: 111AAA11 (3 digits, 3 letters, 2 digits) - example: 035AL115\n"
+                "     * Format 2: 111AA11 (3 digits, 2 letters, 2 digits) - example: 035AL15\n"
+                "     * Region codes: 01-18 ONLY (there is NO region 19)\n"
+                "     * Letters are Latin (A-Z), NOT Cyrillic\n"
+                "   - The plate number MUST match one of these formats exactly.\n"
+                "   - If you cannot clearly read a valid format from the nearest truck, return null for plate.\n"
+                "   - Return the plate number WITHOUT spaces, dashes, or other separators (e.g., '035AL115' not '035 AL 115').\n"
+                "   - DO NOT read plates from trucks that are further away or in the background.\n"
+                "\n"
+                "Return JSON with fields:\n"
+                "- snow_percentage: 0.0-100.0 (how full the bed is with snow, 0-100 scale)\n"
+                "- snow_confidence: 0.0-1.0 (confidence in snow analysis)\n"
+                "- plate: string or null (recognized license plate number in format 111AAA11 or 111AA11, or null if not recognized)\n"
+                "- plate_confidence: 0.0-1.0 (confidence in plate recognition)\n\n"
+                "Example:\n"
+                "{\n"
+                '  "snow_percentage": 42.5,\n'
+                '  "snow_confidence": 0.9,\n'
+                '  "plate": "035AL115",\n'
+                '  "plate_confidence": 0.85\n'
+                "}\n"
+            )
+            
+            print(f"[GEMINI] Sending request to model={self._gemini_model}, "
+                  f"images_count={len(images)}, prompt_length={len(prompt)} chars")
+
+            client = self._get_gemini_client()
+            response = client.models.generate_content(
+                model=self._gemini_model,
+                contents=images + [prompt],
+            )
+            
+            request_duration = time_module.time() - start_time
+            text = (response.text or "").strip()
+            print(f"[GEMINI] Response received in {request_duration:.2f}s, response_length={len(text)} chars")
+            print(f"[GEMINI] Raw response (first 500 chars): {text[:500]}")
+            
+            if not text:
+                print("[GEMINI] ERROR: Empty response from Gemini")
+                return {
+                    "error": "Empty response from Gemini",
+                    "snow_percentage": 0.0,
+                    "snow_confidence": 0.0,
+                    "plate": None,
+                    "plate_confidence": 0.0,
+                }
+
+            # Очищаем ответ от markdown
+            original_text = text
+            if text.startswith("```"):
+                text = text.strip("`")
+                if text.lower().startswith("json"):
+                    text = text[4:].strip()
+                print(f"[GEMINI] Cleaned response (removed markdown): length={len(text)} chars")
+
+            try:
+                result = json.loads(text)
+                print(f"[GEMINI] Successfully parsed JSON: {result}")
+                
+                # Нормализуем результат
+                snow_percentage = result.get("snow_percentage", 0.0)
+                snow_confidence = result.get("snow_confidence", 0.0)
+                plate = result.get("plate")
+                plate_confidence = result.get("plate_confidence", 0.0)
+                
+                # Нормализуем snow_percentage (может быть 0-1 или 0-100)
+                try:
+                    snow_percentage = float(snow_percentage)
+                    if 0.0 <= snow_percentage <= 1.0:
+                        snow_percentage = snow_percentage * 100.0
+                    snow_percentage = max(0.0, min(100.0, round(snow_percentage, 2)))
+                except (ValueError, TypeError):
+                    snow_percentage = 0.0
+                
+                # Нормализуем confidence значения
+                try:
+                    snow_confidence = float(snow_confidence)
+                    snow_confidence = max(0.0, min(1.0, snow_confidence))
+                except (ValueError, TypeError):
+                    snow_confidence = 0.0
+                
+                try:
+                    plate_confidence = float(plate_confidence)
+                    plate_confidence = max(0.0, min(1.0, plate_confidence))
+                except (ValueError, TypeError):
+                    plate_confidence = 0.0
+                
+                # Нормализуем номер (убираем пробелы, приводим к верхнему регистру)
+                if plate:
+                    plate = str(plate).strip().upper().replace(" ", "")
+                    if not plate or plate == "NULL" or plate == "NONE":
+                        plate = None
+                
+                result = {
+                    "snow_percentage": snow_percentage,
+                    "snow_confidence": snow_confidence,
+                    "plate": plate,
+                    "plate_confidence": plate_confidence,
+                }
+                
+                # Сохраняем результат в кэш для дедупликации
+                with self._gemini_cache_lock:
+                    self._gemini_cache[photos_hash] = (result.copy(), current_time)
+                
+                return result
+            except json.JSONDecodeError as e:
+                print(f"[GEMINI] ERROR: JSON parse failed: {e}")
+                print(f"[GEMINI] Failed to parse text: {text[:500]}")
+                return {
+                    "raw": original_text,
+                    "error": f"JSON parse error: {e}",
+                    "snow_percentage": 0.0,
+                    "snow_confidence": 0.0,
+                    "plate": None,
+                    "plate_confidence": 0.0,
+                }
+        except Exception as e:
+            print(f"[GEMINI] EXCEPTION: {type(e).__name__}: {e}")
+            import traceback
+            print(f"[GEMINI] Traceback: {traceback.format_exc()}")
+            return {
+                "error": str(e),
+                "snow_percentage": 0.0,
+                "snow_confidence": 0.0,
+                "plate": None,
+                "plate_confidence": 0.0,
+            }
+
     def _analyze_snow_gemini(
         self, photo_bytes: bytes, bbox: Optional[Any]
     ) -> Dict[str, Any]:
         """
         Analyze truck bed fill via Gemini using in-memory JPEG bytes.
+        (Старая функция, оставлена для обратной совместимости, но больше не используется)
         """
         if not self._gemini_api_key:
             print("[GEMINI] ERROR: GEMINI_API_KEY is not set")
