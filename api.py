@@ -18,6 +18,9 @@ from combined_merger import init_merger
 from limitations.plate_rules import normalize_primary_plate
 import threading
 import time
+import gc
+import psutil
+import os
 
 app = FastAPI(
     title="Hikvision ANPR Wrapper",
@@ -113,8 +116,8 @@ async def _event_queue_worker(worker_name: str):
 async def start_background_workers():
     global _event_queue, _queue_workers_started
     
-    # Создаем очередь обработки событий
-    _event_queue = asyncio.Queue(maxsize=100)
+    # Создаем очередь обработки событий (уменьшено с 100 до 20 для экономии памяти)
+    _event_queue = asyncio.Queue(maxsize=20)
     
     # Запускаем воркеры для обработки очереди (3 параллельных воркера)
     for i in range(3):
@@ -454,6 +457,14 @@ async def _process_event_background(
     Выполняется асинхронно после отправки ответа камере. Без логирования для скорости.
     """
     try:
+        # Логируем использование памяти в начале обработки
+        try:
+            process = psutil.Process(os.getpid())
+            mem_info = process.memory_info()
+            mem_mb = mem_info.rss / 1024 / 1024
+            print(f"[PROCESS] Memory at start: {mem_mb:.1f} MB")
+        except Exception:
+            pass
         # Логируем что получили в фоновой обработке
         print(f"[PROCESS] Background processing: snow_photo_bytes={'present' if snow_photo_bytes else 'None'} ({len(snow_photo_bytes) if snow_photo_bytes else 0} bytes)")
         
@@ -516,6 +527,20 @@ async def _process_event_background(
     except Exception:
         # Тихая обработка ошибок в фоне
         pass
+    finally:
+        # Явно освобождаем память после обработки
+        del detection_bytes, feature_bytes, license_bytes, snow_photo_bytes
+        del plate_photo_1, plate_photo_2
+        gc.collect()
+        
+        # Логируем использование памяти после освобождения
+        try:
+            process = psutil.Process(os.getpid())
+            mem_info = process.memory_info()
+            mem_mb = mem_info.rss / 1024 / 1024
+            print(f"[PROCESS] Memory after cleanup: {mem_mb:.1f} MB")
+        except Exception:
+            pass
 
 
 # === Основной хендлер для Hikvision ANPR ===

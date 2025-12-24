@@ -75,9 +75,9 @@ class TimestampedFrame:
     frame: np.ndarray
     timestamp: float  # time.time()
 
-_frame_buffer: deque[TimestampedFrame] = deque(maxlen=300)  # ~10 секунд при 30 FPS
+_frame_buffer: deque[TimestampedFrame] = deque(maxlen=90)  # ~3 секунды при 30 FPS (уменьшено с 300 для экономии памяти)
 _frame_buffer_lock = threading.Lock()
-BUFFER_DURATION_SECONDS = 10.0  # Храним кадры за последние 10 секунд (для задержки до 9.0 сек)
+BUFFER_DURATION_SECONDS = 3.0  # Храним кадры за последние 3 секунды (уменьшено с 10.0 для экономии памяти)
 
 # YOLO модель для детекции грузовиков
 _yolo_model = None
@@ -440,15 +440,17 @@ def capture_snow_photo(anpr_vehicle_image_bytes: bytes | None = None) -> Optiona
     if model is None:
         print(f"[SNOW] capture_snow_photo: YOLO model not available, using fallback")
     
-    # Целевые временные метки для 5 кадров (каждую секунду: 3, 4, 5, 6, 7 секунд назад)
-    target_delays = [3.0, 4.0, 5.0, 6.0, 7.0]  # секунд назад
+    # Целевые временные метки для 3 кадров (уменьшено с 5 для экономии памяти)
+    # Используем 2, 3, 4 секунды назад (вместо 3, 4, 5, 6, 7)
+    target_delays = [2.0, 3.0, 4.0]  # секунд назад
     
-    # Параллельная обработка ВСЕХ кадров (максимум 3 потока)
+    # Параллельная обработка кадров (уменьшено с 3 до 2 потоков для экономии памяти)
     all_frames_data = []  # Все кадры с данными для сравнения: [(delay, quality_score, frame, bbox, vehicles_count, all_vehicles), ...]
     
     if model is not None:
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            # Уменьшено с 3 до 2 потоков для экономии памяти
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
                 futures = {
                     executor.submit(_process_frame_for_delay, delay, current_time, model): delay
                     for delay in target_delays
@@ -593,6 +595,8 @@ def capture_snow_photo(anpr_vehicle_image_bytes: bytes | None = None) -> Optiona
             delay, quality_score, frame_obj, bbox, vehicles_count = best_frame_data
             print(f"[SNOW] capture_snow_photo: selected frame {delay:.1f}s ago with quality={quality_score:.1f}, vehicles={vehicles_count}, reason={best_reason}")
             frame = frame_obj.frame.copy()
+            # Освобождаем память после выбора кадра
+            del all_frames_data, best_frame_data
         else:
             # Fallback: берем кадр 5 секунд назад без проверки
             print(f"[SNOW] capture_snow_photo: no suitable frames found, using fallback")
@@ -641,6 +645,14 @@ def capture_snow_photo(anpr_vehicle_image_bytes: bytes | None = None) -> Optiona
             frame_age = current_time - best_frame.timestamp
             print(f"[SNOW] capture_snow_photo: fallback frame from {frame_age:.2f}s ago (delta={best_delta:.3f}s)")
         frame = best_frame.frame.copy()
+    
+    # Освобождаем память перед кодированием
+    import gc
+    if 'anpr_image' in locals() and anpr_image is not None:
+        del anpr_image
+    if 'all_frames_data' in locals():
+        del all_frames_data
+    gc.collect()
     
     # Кодируем кадр в JPEG
     try:
@@ -806,6 +818,7 @@ def _snow_loop(upstream_url: str):
         fail_count = 0
         
         # Сохраняем кадр в буфер с временной меткой
+        # ВАЖНО: используем frame.copy() чтобы избежать проблем с переиспользованием буфера OpenCV
         current_timestamp = time.time()
         timestamped_frame = TimestampedFrame(frame=frame.copy(), timestamp=current_timestamp)
         
@@ -821,13 +834,14 @@ def _snow_loop(upstream_url: str):
             # Добавляем новый кадр
             _frame_buffer.append(timestamped_frame)
             
-            # Логируем раз в 8 секунд
-            if current_timestamp - last_log_time >= LOG_INTERVAL_SECONDS:
-                if len(_frame_buffer) > 0:
-                    print(f"[SNOW] buffer size: {len(_frame_buffer)} frames, "
-                          f"oldest: {current_timestamp - _frame_buffer[0].timestamp:.2f}s ago, "
-                          f"newest: {current_timestamp - _frame_buffer[-1].timestamp:.2f}s ago")
-                last_log_time = current_timestamp
+            # Логирование размера буфера отключено для уменьшения мусора в логах
+            # Раскомментируйте для диагностики:
+            # if current_timestamp - last_log_time >= LOG_INTERVAL_SECONDS:
+            #     if len(_frame_buffer) > 0:
+            #         print(f"[SNOW] buffer size: {len(_frame_buffer)} frames, "
+            #               f"oldest: {current_timestamp - _frame_buffer[0].timestamp:.2f}s ago, "
+            #               f"newest: {current_timestamp - _frame_buffer[-1].timestamp:.2f}s ago")
+            #     last_log_time = current_timestamp
 
         if SHOW_WINDOW:
             cv2.imshow(window_name, cv2.resize(frame, (960, 540)))
