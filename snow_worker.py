@@ -17,6 +17,13 @@ SNOW_VIDEO_SOURCE_URL = os.getenv("SNOW_VIDEO_SOURCE_URL", "")
 SNOW_CAMERA_ID = os.getenv("SNOW_CAMERA_ID", "camera-snow")
 SNOW_CAPTURE_DELAY_SECONDS = float(os.getenv("SNOW_CAPTURE_DELAY_SECONDS", "1.0"))  # Задержка перед захватом фото
 
+# Линия пересечения (нормированные координаты 0..1)
+LINE_X1 = float(os.getenv("LINE_X1", "0.1"))
+LINE_Y1 = float(os.getenv("LINE_Y1", "0.8"))
+LINE_X2 = float(os.getenv("LINE_X2", "0.9"))
+LINE_Y2 = float(os.getenv("LINE_Y2", "0.8"))
+LINE_DIRECTION = os.getenv("LINE_DIRECTION", "any").strip().lower()  # any | forward | backward
+
 TRUCK_CLASS_ID = int(os.getenv("SNOW_TRUCK_CLASS_ID", "7"))
 CONFIDENCE_THRESHOLD = float(os.getenv("SNOW_CONFIDENCE_THRESHOLD", "0.55"))
 MIN_BBOX_AREA = int(os.getenv("SNOW_MIN_BBOX_AREA", "40000"))  # Минимальная площадь bbox (px^2) для приоритета
@@ -68,6 +75,7 @@ _snow_thread: threading.Thread | None = None
 _stop_event = threading.Event()
 _cap: cv2.VideoCapture | None = None
 _cap_lock = threading.Lock()
+_merger = None
 
 # Буфер кадров с временными метками для доступа к прошлым кадрам
 @dataclass
@@ -775,13 +783,17 @@ def _encode_frame_to_jpeg(frame: np.ndarray) -> Tuple[bytes, datetime]:
 
 # === Основной цикл снежной камеры (упрощенный - только чтение потока) ===
 
-def _snow_loop(upstream_url: str):
+def _snow_loop():
     """
     Упрощенный цикл: читает RTSP поток и сохраняет кадры в буфер с временными метками.
     Автоматические события больше не создаются - фото делается по запросу через capture_snow_photo().
     Кадры сохраняются в буфер, чтобы можно было получить кадр из прошлого (когда машина была под снеговой камерой).
     """
     global _cap, _frame_buffer
+    last_side = None
+    last_trigger_ts = 0.0
+    last_bbox: Optional[Tuple[int, int, int, int]] = None
+    line_norm = (LINE_X1, LINE_Y1, LINE_X2, LINE_Y2)
     
     _cap = cv2.VideoCapture(SNOW_VIDEO_SOURCE_URL, cv2.CAP_FFMPEG)
     if not _cap.isOpened():
@@ -797,6 +809,7 @@ def _snow_loop(upstream_url: str):
     MAX_FAILS = 15
     last_log_time = 0.0
     LOG_INTERVAL_SECONDS = 8.0  # Логируем раз в 8 секунд
+    frame_counter = 0
 
     print(f"[SNOW] worker started (buffering mode - storing frames for {BUFFER_DURATION_SECONDS}s)")
     
@@ -844,7 +857,23 @@ def _snow_loop(upstream_url: str):
             #     last_log_time = current_timestamp
 
         if SHOW_WINDOW:
-            cv2.imshow(window_name, cv2.resize(frame, (960, 540)))
+            vis = frame.copy()
+            # рисуем линию
+            lx1, ly1, lx2, ly2 = line_norm
+            h, w = vis.shape[:2]
+            cv2.line(
+                vis,
+                (int(lx1 * w), int(ly1 * h)),
+                (int(lx2 * w), int(ly2 * h)),
+                (0, 255, 255),
+                2,
+                lineType=cv2.LINE_AA,
+            )
+            # рисуем bbox последней машины
+            if last_bbox:
+                x1, y1, x2, y2 = last_bbox
+                cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 200, 0), 2)
+            cv2.imshow(window_name, cv2.resize(vis, (960, 540)))
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q") or key == 27:
                 _stop_event.set()
@@ -852,6 +881,75 @@ def _snow_loop(upstream_url: str):
 
         # Небольшая пауза, чтобы не грузить CPU
         time.sleep(0.01)
+        frame_counter += 1
+
+        # Проверяем пересечение линии каждые кадр
+        try:
+            h, w = frame.shape[:2]
+            # Достаём лучшую машину (по качеству) и центр
+            model = _get_yolo_model()
+            if model is None:
+                continue
+            quality_score, bbox, vehicles_count, all_veh = _assess_frame_quality(frame, time.time(), model)
+            if quality_score <= 0 or not bbox:
+                last_bbox = None
+                continue
+            x1, y1, x2, y2 = bbox
+            last_bbox = bbox
+            cx = (x1 + x2) // 2
+            cy = (y1 + y2) // 2
+
+            # Вычисляем сторону относительно линии
+            lx1, ly1, lx2, ly2 = line_norm
+            ax = lx1 * w
+            ay = ly1 * h
+            bx = lx2 * w
+            by = ly2 * h
+            cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+            side = 1 if cross > 0 else -1
+
+            # Направление: forward = слева->справа относительно A->B, backward наоборот
+            allowed = False
+            if last_side is None:
+                last_side = side
+                continue
+            if side != last_side:
+                if LINE_DIRECTION == "any":
+                    allowed = True
+                elif LINE_DIRECTION == "forward" and last_side > 0 and side < 0:
+                    allowed = True
+                elif LINE_DIRECTION == "backward" and last_side < 0 and side > 0:
+                    allowed = True
+
+            if allowed and (time.time() - last_trigger_ts) > 1.0:
+                last_trigger_ts = time.time()
+                last_side = side
+                try:
+                    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                    if not ok:
+                        continue
+                    photo_bytes = buf.tobytes()
+                    payload = {
+                        "event_time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        "camera_id": SNOW_CAMERA_ID,
+                        "bbox": bbox,
+                        "line": {
+                            "x1": LINE_X1,
+                            "y1": LINE_Y1,
+                            "x2": LINE_X2,
+                            "y2": LINE_Y2,
+                            "direction": LINE_DIRECTION,
+                        },
+                    }
+                    if _merger:
+                        _merger.add_snow_event(payload, photo_bytes)
+                        print(f"[SNOW] line crossed, snow event pushed to merger, bytes={len(photo_bytes)}")
+                except Exception as e:
+                    print(f"[SNOW] error on line crossing capture: {e}")
+            else:
+                last_side = side
+        except Exception:
+            pass
 
     with _cap_lock:
         if _cap is not None:
@@ -862,12 +960,13 @@ def _snow_loop(upstream_url: str):
     print("[SNOW] worker stopped")
 
 
-def start_snow_worker(upstream_url: str):
+def start_snow_worker(merger):
     """
     Запуск снегового воркера в отдельном потоке.
     Воркер читает RTSP поток и поддерживает его активным для мгновенного захвата кадров по запросу.
     """
-    global _snow_thread
+    global _snow_thread, _merger
+    _merger = merger
     if _snow_thread is not None:
         return
     if not SNOW_VIDEO_SOURCE_URL:
@@ -877,7 +976,6 @@ def start_snow_worker(upstream_url: str):
     _stop_event.clear()
     _snow_thread = threading.Thread(
         target=_snow_loop,
-        args=(upstream_url,),
         daemon=True,
         name="snow-worker",
     )

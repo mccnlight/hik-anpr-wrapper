@@ -393,19 +393,7 @@ class EventMerger:
             now = _now()
             with self._lock:
                 self._cleanup(now)
-                # Логируем состояние очередей для диагностики
-                if len(self._snow_events) > 0:
-                    oldest_age = (now - self._snow_events[0].event_time).total_seconds()
-                    newest_age = (now - self._snow_events[-1].event_time).total_seconds()
-                    print(f"[MERGER] SNOW QUEUE STATUS: size={len(self._snow_events)}, "
-                          f"oldest_age={oldest_age:.1f}s, newest_age={newest_age:.1f}s, "
-                          f"window={self.window.total_seconds()}s, ttl={self.ttl.total_seconds()}s")
-                if len(self._anpr_events) > 0:
-                    oldest_age = (now - self._anpr_events[0].event_time).total_seconds()
-                    newest_age = (now - self._anpr_events[-1].event_time).total_seconds()
-                    print(f"[MERGER] ANPR QUEUE STATUS: size={len(self._anpr_events)}, "
-                          f"oldest_age={oldest_age:.1f}s, newest_age={newest_age:.1f}s, "
-                          f"window={self.window.total_seconds()}s, ttl={self.ttl.total_seconds()}s")
+                # Логирование очередей убрано, чтобы не засорять терминал
 
     def _get_gemini_client(self) -> genai.Client:
         if self._gemini_client is None:
@@ -846,7 +834,7 @@ class EventMerger:
         now = _now()
         anpr_time_str = str(anpr_event.get("event_time", ""))
         anpr_time = _parse_iso_dt(anpr_time_str) or now
-        plate = str(anpr_event.get("plate") or "")
+        plate = str(anpr_event.get("plate") or "").strip()
         
         # Логируем разницу между временем ANPR и текущим временем для диагностики
         anpr_time_diff = (now - anpr_time).total_seconds()
@@ -924,7 +912,10 @@ class EventMerger:
         combined_event = dict(anpr_event)
         snow_analysis = None
 
-        plate = str(anpr_event.get("plate") or "")
+        plate = str(anpr_event.get("plate") or "").strip()
+        if not plate:
+            plate = "UNKNOWN"
+            combined_event["plate"] = plate
         event_time_iso = str(anpr_event.get("event_time") or "")
         now = _now()
 
