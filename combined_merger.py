@@ -75,6 +75,83 @@ def _now() -> datetime:
     return datetime.now(tz=LOCAL_TZ)
 
 
+def _validate_kazakhstan_plate(plate: str | None) -> str | None:
+    """
+    Валидирует казахстанский номер по формату.
+    Форматы: 111AAA11 (3 цифры региона, 3 буквы, 2 цифры) или 111AA11 (3 цифры региона, 2 буквы, 2 цифры).
+    Регионы: первые 2 цифры должны быть 01-18.
+    """
+    if not plate:
+        return None
+    
+    plate = str(plate).strip().upper().replace(" ", "").replace("-", "")
+    
+    if not plate or plate in ["NULL", "NONE", "UNKNOWN"]:
+        return None
+    
+    # Проверяем формат 1: 111AAA11 (8 символов: 3 цифры региона, 3 буквы, 2 цифры)
+    if len(plate) == 8:
+        region_part = plate[:3]
+        letters_part = plate[3:6]
+        digits_part = plate[6:8]
+        
+        # Проверяем, что первые 2 цифры региона - это 01-18
+        try:
+            region_code = int(region_part[:2])
+            if region_code < 1 or region_code > 18:
+                print(f"[VALIDATE] Invalid region code: {region_code} (must be 01-18), plate: {plate}")
+                return None
+        except ValueError:
+            print(f"[VALIDATE] Invalid region format, plate: {plate}")
+            return None
+        
+        # Проверяем, что все части правильные
+        if not region_part.isdigit():
+            print(f"[VALIDATE] Invalid region digits in plate: {plate}")
+            return None
+        if not digits_part.isdigit():
+            print(f"[VALIDATE] Invalid ending digits in plate: {plate}")
+            return None
+        if len(letters_part) != 3 or not letters_part.isalpha() or not all(c.isascii() and c.isupper() for c in letters_part):
+            print(f"[VALIDATE] Invalid letters part (must be exactly 3 Latin letters): {letters_part} in plate: {plate}")
+            return None
+        
+        return plate
+    
+    # Проверяем формат 2: 111AA11 (7 символов: 3 цифры региона, 2 буквы, 2 цифры)
+    if len(plate) == 7:
+        region_part = plate[:3]
+        letters_part = plate[3:5]
+        digits_part = plate[5:7]
+        
+        # Проверяем, что первые 2 цифры региона - это 01-18
+        try:
+            region_code = int(region_part[:2])
+            if region_code < 1 or region_code > 18:
+                print(f"[VALIDATE] Invalid region code: {region_code} (must be 01-18), plate: {plate}")
+                return None
+        except ValueError:
+            print(f"[VALIDATE] Invalid region format, plate: {plate}")
+            return None
+        
+        # Проверяем, что все части правильные
+        if not region_part.isdigit():
+            print(f"[VALIDATE] Invalid region digits in plate: {plate}")
+            return None
+        if not digits_part.isdigit():
+            print(f"[VALIDATE] Invalid ending digits in plate: {plate}")
+            return None
+        if len(letters_part) != 2 or not letters_part.isalpha() or not all(c.isascii() and c.isupper() for c in letters_part):
+            print(f"[VALIDATE] Invalid letters part (must be exactly 2 Latin letters): {letters_part} in plate: {plate}")
+            return None
+        
+        return plate
+    
+    # Неправильная длина
+    print(f"[VALIDATE] Invalid plate length: {len(plate)} (must be 7 or 8), plate: {plate}")
+    return None
+
+
 @dataclass
 class SnowEvent:
     event_time: datetime
@@ -504,15 +581,23 @@ class EventMerger:
             camera_plate_text = ""
             if camera_plate and camera_plate.lower() not in ["unknown", "none", ""]:
                 camera_plate_text = (
-                    f"\nIMPORTANT: The camera detected plate number '{camera_plate}', but this may be INCORRECT. "
-                    "You must verify and correct it by carefully reading the actual plate from the images. "
-                    "Use the camera's suggestion only as a hint, but always verify against what you see in the photos.\n"
+                    f"\nIMPORTANT: The camera detected plate number '{camera_plate}'. "
+                    "However, cameras can make mistakes, especially with similar-looking characters (R/B, O/0, I/1, etc.). "
+                    "Your task is to VERIFY and CORRECT this number by carefully reading it from the images. "
+                    "Pay special attention to each character, especially in night conditions with glare or blur. "
+                    "CRITICAL: Verify that the number matches Kazakhstan format (regions 01-18). "
+                    "If '{camera_plate}' has an invalid region code (like 115, 119, etc.), it's definitely wrong - read the correct number from images. "
+                    "If you can clearly see a different character that contradicts the camera, use what you see. "
+                    "If the images are unclear but the camera detected '{camera_plate}', use it as a strong reference "
+                    "but double-check each character for common mistakes (R vs B, O vs 0, etc.) and validate the region code.\n"
                 )
             elif camera_plate and camera_plate.lower() == "unknown":
                 camera_plate_text = (
                     f"\nIMPORTANT: The camera could not detect a plate number (returned 'unknown'). "
                     "You must carefully read the license plate from the images provided. "
-                    "Look at both IMAGE 2 (normal view) and IMAGE 3 (close-up view if provided) to extract the plate number.\n"
+                    "Look at both IMAGE 2 (normal view) and IMAGE 3 (close-up view if provided) to extract the plate number. "
+                    "In night conditions or poor lighting, the plate may be partially visible - try your best to read it. "
+                    "Remember: Kazakhstan format requires regions 01-18 only.\n"
                 )
             
             prompt = (
@@ -529,26 +614,80 @@ class EventMerger:
                 "1. Analyze IMAGE 1 (snow photo):\n"
                 "   - Identify the truck that is CLOSEST to the camera (largest in the frame, on the nearest lane).\n"
                 "   - Analyze ONLY the cargo bed of THIS nearest truck.\n"
+                "   - IMPORTANT: In real-world scenarios, trucks typically carry 85-100% snow volume when loaded. "
+                "     If you see ANY visible snow in the cargo bed (even partially visible), the percentage should "
+                "     be HIGH (typically 85-100%), not low. Only set low percentages (0-20%) if the bed is "
+                "     completely empty or contains only non-snow materials.\n"
                 "   - Classify ONLY loose/bulk snow inside the OPEN cargo bed of the nearest truck.\n"
+                "   - Snow characteristics to look for:\n"
+                "     * White or light gray loose material with visible texture/grain\n"
+                "     * Uneven surface with bumps, mounds, or irregular shapes\n"
+                "     * Material that appears soft, fluffy, or granular\n"
+                "     * Often piled higher than the bed sides or filling most of the bed\n"
+                "     * May have shadows, depressions, or visible depth\n"
+                "   - Calculate snow_percentage as the VISIBLE AREA of snow relative to the total cargo bed area:\n"
+                "     * 85-100%: Bed is mostly or completely filled with snow (most common case)\n"
+                "     * 60-84%: Bed is more than half filled with snow\n"
+                "     * 40-59%: Bed is about half filled with snow\n"
+                "     * 20-39%: Bed is less than half filled but has significant snow\n"
+                "     * 0-19%: Bed is mostly empty or contains only non-snow materials\n"
                 "   - Exclude: painted/clean metal or plastic surfaces, tarps, roof/hood, sides of the truck,\n"
                 "     sun glare, white paint, reflections, frost/ice, road, background, or closed/covered beds.\n"
                 "   - If the bed of the nearest truck is not clearly visible or is closed/covered/fully outside the frame, set snow_percentage=0 and snow_confidence=0.0.\n"
                 "   - Snow must look like uneven/loose material with texture; a smooth flat surface (even if white) is NOT snow.\n"
                 "   - DO NOT analyze snow in trucks that are further away or in the background.\n"
+                "   - REMEMBER: If you can see snow in the bed (even if partially obscured), it's likely 85-100% full. "
+                "     Only use lower percentages if the bed is clearly mostly empty.\n"
                 "\n"
                 "2. Recognize license plate from IMAGE 2 (and IMAGE 3 if provided):\n"
                 "   - Identify the truck that is CLOSEST to the camera (largest in the frame, on the nearest lane).\n"
                 "   - Extract the license plate number from THIS nearest truck ONLY.\n"
                 "   - You have TWO photos: IMAGE 2 is normal/wide view, IMAGE 3 (if provided) is close-up/zoomed view.\n"
                 "   - Use BOTH photos to get the most accurate result - the close-up (IMAGE 3) usually has better detail.\n"
-                "   - Kazakhstan license plate format is STRICT:\n"
-                "     * Format 1: 111AAA11 (3 digits, 3 letters, 2 digits) - example: 035AL115\n"
-                "     * Format 2: 111AA11 (3 digits, 2 letters, 2 digits) - example: 035AL15\n"
-                "     * Region codes: 01-18 ONLY (there is NO region 19)\n"
+                "   - IMPORTANT: Many trucks in Kazakhstan display their license plate on a paper sheet taped to the WINDSHIELD (front glass).\n"
+                "     * FIRST, check the WINDSHIELD for a paper sheet with the license plate number - this is often EASIER to read\n"
+                "       because it's usually printed clearly and may be better lit or less affected by glare.\n"
+                "     * If you see a license plate number on a paper sheet on the windshield, use THAT number - it's typically more reliable.\n"
+                "     * If there's NO paper sheet on the windshield, then look for the standard metal license plate on the front bumper.\n"
+                "     * The paper sheet is usually placed in the center or lower part of the windshield, clearly visible from the front.\n"
+                "     * Paper sheet numbers are often printed in large, clear font and may be easier to read than the metal plate,\n"
+                "       especially in night conditions or when the metal plate is dirty, damaged, or poorly lit.\n"
+                "   - CRITICAL FOR NIGHT/POOR LIGHTING CONDITIONS:\n"
+                "     * In dark images with headlight glare, license plates may be partially obscured or overexposed.\n"
+                "     * Look for the plate in areas NOT directly hit by headlights - check edges and shadows.\n"
+                "     * If the plate is overexposed (white/very bright), try to read characters from darker edges.\n"
+                "     * If characters are blurry due to motion, look for the clearest parts of each character.\n"
+                "     * Compare characters between IMAGE 2 and IMAGE 3 - one may be clearer than the other.\n"
+                "   - CRITICAL: Pay EXTREME attention to similar-looking letters and numbers. Common mistakes:\n"
+                "     * R vs B: R has a diagonal leg from top-right going down-left, B has two horizontal parts (top and middle).\n"
+                "       In poor lighting, R may look like B if the diagonal leg is not visible - look carefully for the diagonal!\n"
+                "     * O vs 0 (zero) vs D: O is perfectly round, 0 is oval/slightly narrower, D has a flat vertical side.\n"
+                "     * I vs 1 (one) vs L: I is thin vertical line, 1 has a base/serif, L has a horizontal bottom.\n"
+                "     * S vs 5 (five): S curves smoothly on both ends, 5 has a straight top and curved bottom.\n"
+                "     * Z vs 2 (two): Z has sharp diagonal angles, 2 has a curved bottom.\n"
+                "     * A vs 4: A is triangular with horizontal bar, 4 has a vertical line on the right.\n"
+                "     * E vs F: E has three horizontal lines (top, middle, bottom), F has two (missing bottom).\n"
+                "   - When reading each character, examine it from multiple angles if visible in both images:\n"
+                "     * Look at the shape, not just the overall appearance.\n"
+                "     * Check for distinguishing features (diagonal lines, curves, straight lines).\n"
+                "     * If a character is ambiguous, choose the one that makes more sense in Kazakhstan format context.\n"
+                "   - CRITICAL: This is a KAZAKHSTAN license plate. The format is VERY STRICT:\n"
+                "     * Format 1: 111AAA11 (3 digits for region, 3 letters, 2 digits) - example: 035AER15\n"
+                "     * Format 2: 111AA11 (3 digits for region, 2 letters, 2 digits) - example: 035AE15\n"
+                "     * REGION CODES: The FIRST 2 DIGITS must be 01, 02, 03, 04, 05, 06, 07, 08, 09, 10, 11, 12, 13, 14, 15, 16, 17, or 18.\n"
+                "     * THERE IS NO REGION 19, 20, 100, 115, 119, etc. - ONLY 01-18!\n"
+                "     * The third digit of the region can be any digit (0-9), but first two MUST be 01-18.\n"
+                "     * Examples of VALID regions: 001, 015, 018, 035, 105, 115 (first two digits are 01-18)\n"
+                "     * Examples of INVALID regions: 119 (starts with 11, but 19 is not valid), 200, 999\n"
                 "     * Letters are Latin (A-Z), NOT Cyrillic\n"
-                "   - The plate number MUST match one of these formats exactly.\n"
+                "   - VALIDATION: Before returning a plate number, verify:\n"
+                "     * Does it match Format 1 (111AAA11) or Format 2 (111AA11)?\n"
+                "     * Are the first 2 digits between 01-18?\n"
+                "     * Are all letters Latin (A-Z)?\n"
+                "     * If ANY of these checks fail, the number is INVALID - return null instead.\n"
+                "   - The plate number MUST match one of these formats exactly and pass all validation.\n"
                 "   - If you cannot clearly read a valid format from the nearest truck, return null for plate.\n"
-                "   - Return the plate number WITHOUT spaces, dashes, or other separators (e.g., '035AL115' not '035 AL 115').\n"
+                "   - Return the plate number WITHOUT spaces, dashes, or other separators (e.g., '035AER15' not '035 AER 15').\n"
                 "   - DO NOT read plates from trucks that are further away or in the background.\n"
                 "\n"
                 "Return JSON with fields:\n"
@@ -556,13 +695,15 @@ class EventMerger:
                 "- snow_confidence: 0.0-1.0 (confidence in snow analysis)\n"
                 "- plate: string or null (recognized license plate number in format 111AAA11 or 111AA11, or null if not recognized)\n"
                 "- plate_confidence: 0.0-1.0 (confidence in plate recognition)\n\n"
-                "Example:\n"
+                "Example (typical case with loaded truck):\n"
                 "{\n"
-                '  "snow_percentage": 42.5,\n'
-                '  "snow_confidence": 0.9,\n'
-                '  "plate": "035AL115",\n'
+                '  "snow_percentage": 92.5,\n'
+                '  "snow_confidence": 0.95,\n'
+                '  "plate": "035AER15",\n'
                 '  "plate_confidence": 0.85\n'
                 "}\n"
+                "Note: Region 035 is valid (starts with 03, which is in range 01-18). "
+                "Invalid examples: 119AB115 (region 119 doesn't exist), 200AB15 (region 20 doesn't exist).\n"
             )
             
             print(f"[GEMINI] Sending request to model={self._gemini_model}, "
@@ -635,6 +776,18 @@ class EventMerger:
                     if not plate or plate == "NULL" or plate == "NONE":
                         plate = None
                 
+                # Валидируем казахстанский номер - проверяем формат и регион
+                if plate:
+                    validated_plate = _validate_kazakhstan_plate(plate)
+                    if validated_plate != plate:
+                        print(f"[GEMINI] Plate validation failed: '{plate}' -> None (invalid Kazakhstan format)")
+                        plate = None
+                    elif validated_plate is None:
+                        print(f"[GEMINI] Plate validation failed: '{plate}' -> None (invalid format)")
+                        plate = None
+                    else:
+                        print(f"[GEMINI] Plate validation passed: '{plate}'")
+                
                 result = {
                     "snow_percentage": snow_percentage,
                     "snow_confidence": snow_confidence,
@@ -704,6 +857,18 @@ class EventMerger:
 
             prompt = (
                 "You see the OPEN cargo bed of a truck. Classify ONLY loose/bulk snow inside the bed.\n"
+                "IMPORTANT: In real-world scenarios, trucks typically carry 85-100% snow volume when loaded. "
+                "If you see ANY visible snow in the cargo bed (even partially visible), the percentage should "
+                "be HIGH (typically 85-100%), not low. Only set low percentages (0-20%) if the bed is "
+                "completely empty or contains only non-snow materials.\n"
+                "Snow characteristics: white/light gray loose material with texture, uneven surface with bumps/mounds, "
+                "soft/fluffy/granular appearance, often piled higher than bed sides or filling most of the bed.\n"
+                "Calculate percentage as VISIBLE AREA of snow relative to total cargo bed area:\n"
+                "- 85-100%: Bed mostly/completely filled (most common)\n"
+                "- 60-84%: Bed more than half filled\n"
+                "- 40-59%: Bed about half filled\n"
+                "- 20-39%: Bed less than half but has significant snow\n"
+                "- 0-19%: Bed mostly empty or only non-snow materials\n"
                 "Critical exclusions: painted/clean metal or plastic surfaces, tarps, roof/hood, sides of the truck,\n"
                 "sun glare, white paint, reflections, frost/ice, road, background, or closed/covered beds.\n"
                 "If the bed is not clearly visible or is closed/covered/fully outside the frame, set percentage=0 and confidence=0.0.\n"
@@ -711,10 +876,10 @@ class EventMerger:
                 "Return JSON with fields:\n"
                 "- percentage: 0.0-1.0 or 0-100 for how full with snow\n"
                 "- confidence: 0.0-1.0\n\n"
-                "Example:\n"
+                "Example (typical loaded truck):\n"
                 "{\n"
-                '  \"percentage\": 0.42,\n'
-                '  \"confidence\": 0.9\n'
+                '  \"percentage\": 92.5,\n'
+                '  \"confidence\": 0.95\n'
                 "}\n"
             )
             print(f"[GEMINI] Sending request to model={self._gemini_model}, prompt_length={len(prompt)} chars")
