@@ -54,6 +54,12 @@ def preprocess_plate(img: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     # Выравниваем контраст
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     clahe_img = clahe.apply(gray)
+    
+    # Очень слабое затемнение (уменьшение яркости на 5-8%)
+    # Помогает при слишком ярких фотографиях для лучшей читаемости
+    darken_factor = 0.93  # Уменьшаем яркость на 7% (очень слабо)
+    clahe_img = cv2.convertScaleAbs(clahe_img, alpha=darken_factor, beta=0)
+    
     clahe_bgr = cv2.cvtColor(clahe_img, cv2.COLOR_GRAY2BGR)
 
     # --- вместо bilateral + adaptiveThreshold делаем так ---

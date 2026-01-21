@@ -14,10 +14,19 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from modules.anpr import ANPR
+from modules.upscale_hat import HATUpscaler
+from modules.frame_buffer import FrameBuffer
+from modules.blur import variance_of_laplacian
+from modules.preprocess_ocr import preprocess_for_ocr
+from clients.plate_recognizer import PlateRecognizerClient
+from pipeline.plate_recognition import recognize_with_fallback, select_best_roi_from_buffer
 from combined_merger import init_merger
 from limitations.plate_rules import normalize_primary_plate
 import threading
 import time
+from dotenv import load_dotenv
+
+load_dotenv("app.env")
 
 app = FastAPI(
     title="Hikvision ANPR Wrapper",
@@ -63,6 +72,10 @@ async def log_requests(request: Request, call_next):
 # создаём движок один раз, чтобы модели не грузились на каждый запрос
 engine = ANPR()
 
+def _env_flag(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
 # URL внешнего сервиса, куда шлём JSON + фото
 UPSTREAM_URL = os.getenv(
     "UPSTREAM_URL", "https://snowops-anpr-service.onrender.com/api/v1/anpr/events"
@@ -71,8 +84,149 @@ PLATE_CAMERA_ID = os.getenv("PLATE_CAMERA_ID", "camera-001")
 MERGE_WINDOW_SECONDS = int(os.getenv("MERGE_WINDOW_SECONDS", "120"))
 MERGE_TTL_SECONDS = int(os.getenv("MERGE_TTL_SECONDS", "180"))
 ENABLE_SNOW_WORKER = os.getenv("ENABLE_SNOW_WORKER", "false").lower() == "true"
+ENABLE_HAT_UPSCALE = _env_flag("ENABLE_HAT_UPSCALE", "false")
 VEHICLE_CHECK_URL = os.getenv("VEHICLE_CHECK_URL")  # опционально: GET ?plate=KZ123ABC -> 200 если есть
 VEHICLE_CHECK_TOKEN = os.getenv("VEHICLE_CHECK_TOKEN", "")
+
+# Plate Recognizer (cloud)
+PLR_ENABLED = os.getenv("PLR_ENABLED", "0").lower() in ("1", "true", "yes", "on")
+PLR_TOKEN = os.getenv("PLR_TOKEN", "")
+PLR_BASE_URL = os.getenv(
+    "PLR_BASE_URL", "https://api.platerecognizer.com/v1/plate-reader/"
+)
+PLR_REGIONS = os.getenv("PLR_REGIONS", "kz")
+PLR_TIMEOUT_SECONDS = float(os.getenv("PLR_TIMEOUT_SECONDS", "8"))
+PLR_MIN_SCORE = float(os.getenv("PLR_MIN_SCORE", "0.75"))
+PLR_TRY_PREPROCESSED = os.getenv("PLR_TRY_PREPROCESSED", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+# Blur / buffer
+BLUR_THRESHOLD = float(os.getenv("BLUR_THRESHOLD", "60.0"))
+FRAME_BUFFER_SECONDS = float(os.getenv("FRAME_BUFFER_SECONDS", "1.2"))
+FRAME_BUFFER_FPS = int(os.getenv("FRAME_BUFFER_FPS", "10"))
+FRAME_BUFFER_MAX_W = int(os.getenv("FRAME_BUFFER_MAX_W", "1280"))
+FRAME_BUFFER_MAX_H = int(os.getenv("FRAME_BUFFER_MAX_H", "720"))
+
+# Debug
+DEBUG_SAVE = os.getenv("DEBUG_SAVE", "0").lower() in ("1", "true", "yes", "on")
+DEBUG_SAVE_DIR = os.getenv("DEBUG_SAVE_DIR", "debug_plr")
+
+hat_upscaler = None
+if ENABLE_HAT_UPSCALE:
+    try:
+        hat_upscaler = HATUpscaler()
+        print("[HAT] Upscaler initialized")
+    except Exception as e:
+        print(f"[HAT] Failed to initialize upscaler: {e}")
+        hat_upscaler = None
+print(f"[HAT] ENABLE_HAT_UPSCALE={ENABLE_HAT_UPSCALE} (env)")
+
+plate_frame_buffer = FrameBuffer(
+    seconds=FRAME_BUFFER_SECONDS,
+    fps=FRAME_BUFFER_FPS,
+    max_width=FRAME_BUFFER_MAX_W,
+    max_height=FRAME_BUFFER_MAX_H,
+)
+
+plr_client: PlateRecognizerClient | None = None
+if PLR_ENABLED and PLR_TOKEN:
+    plr_client = PlateRecognizerClient(
+        base_url=PLR_BASE_URL,
+        token=PLR_TOKEN,
+        timeout_seconds=PLR_TIMEOUT_SECONDS,
+    )
+
+
+def _maybe_hat_upscale_jpeg(photo_bytes: bytes, label: str) -> bytes:
+    if not ENABLE_HAT_UPSCALE or not photo_bytes:
+        return photo_bytes
+    if hat_upscaler is None:
+        return _fallback_upscale_jpeg(photo_bytes, label)
+    try:
+        np_arr = np.frombuffer(photo_bytes, np.uint8)
+        img_bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if img_bgr is None:
+            return photo_bytes
+        enhanced = hat_upscaler.enhance(img_bgr)
+        ok, buf = cv2.imencode(".jpg", enhanced, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        if not ok:
+            return photo_bytes
+        print(
+            f"[HAT] Enhanced {label}: {img_bgr.shape[1]}x{img_bgr.shape[0]} -> "
+            f"{enhanced.shape[1]}x{enhanced.shape[0]}"
+        )
+        return buf.tobytes()
+    except Exception as e:
+        print(f"[HAT] Error upscaling {label}: {e}")
+        return _fallback_upscale_jpeg(photo_bytes, label)
+
+
+def _crop_plate_roi(
+    frame: np.ndarray, bbox: Optional[tuple[int, int, int, int]]
+) -> Optional[np.ndarray]:
+    if frame is None or frame.size == 0:
+        return None
+    h, w = frame.shape[:2]
+    if bbox is None:
+        return frame.copy()
+
+    x1, y1, x2, y2 = bbox
+    x1 = max(0, min(x1, w - 1))
+    x2 = max(0, min(x2, w - 1))
+    y1 = max(0, min(y1, h - 1))
+    y2 = max(0, min(y2, h - 1))
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    bw = x2 - x1
+    bh = y2 - y1
+    roi_x1 = x1 + int(bw * 0.15)
+    roi_x2 = x2 - int(bw * 0.15)
+    roi_y1 = y1 + int(bh * 0.55)
+    roi_y2 = y1 + int(bh * 0.90)
+
+    roi_x1 = max(0, min(roi_x1, w - 1))
+    roi_x2 = max(0, min(roi_x2, w - 1))
+    roi_y1 = max(0, min(roi_y1, h - 1))
+    roi_y2 = max(0, min(roi_y2, h - 1))
+
+    if roi_x2 <= roi_x1 or roi_y2 <= roi_y1:
+        return frame[y1:y2, x1:x2].copy()
+
+    return frame[roi_y1:roi_y2, roi_x1:roi_x2].copy()
+
+
+def _fallback_upscale_jpeg(photo_bytes: bytes, label: str, scale: int = 4) -> bytes:
+    if not photo_bytes:
+        return photo_bytes
+    try:
+        np_arr = np.frombuffer(photo_bytes, np.uint8)
+        img_bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if img_bgr is None:
+            return photo_bytes
+        h, w = img_bgr.shape[:2]
+        up = cv2.resize(
+            img_bgr,
+            (w * scale, h * scale),
+            interpolation=cv2.INTER_LANCZOS4,
+        )
+        # Mild unsharp mask to make edges crisper
+        blur = cv2.GaussianBlur(up, (0, 0), 0.8)
+        sharp = cv2.addWeighted(up, 1.2, blur, -0.2, 0)
+        ok, buf = cv2.imencode(".jpg", sharp, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        if not ok:
+            return photo_bytes
+        print(
+            f"[HAT] Fallback upscale {label}: {w}x{h} -> {sharp.shape[1]}x{sharp.shape[0]}"
+        )
+        return buf.tobytes()
+    except Exception as e:
+        print(f"[HAT] Fallback upscale error {label}: {e}")
+        return photo_bytes
 
 merger = init_merger(
     upstream_url=UPSTREAM_URL,
@@ -457,7 +611,113 @@ async def _process_event_background(
         # Логируем что получили в фоновой обработке
         print(f"[PROCESS] Background processing: snow_photo_bytes={'present' if snow_photo_bytes else 'None'} ({len(snow_photo_bytes) if snow_photo_bytes else 0} bytes)")
         
-        # 1. Вызываем Gemini для анализа (если есть снег и хотя бы одно фото номера)
+        # 1) Подбираем лучший ROI из буфера + license/feature
+        # Функция для upscale ROI (если включен HAT upscale)
+        def _upscale_roi_for_buffer(roi: np.ndarray) -> np.ndarray:
+            """Применяет upscale к ROI из буфера если включен HAT upscale"""
+            if not ENABLE_HAT_UPSCALE or hat_upscaler is None:
+                return roi
+            try:
+                upscaled = hat_upscaler.enhance(roi)
+                print(f"[UPSCALE] Buffer ROI upscaled: {roi.shape[1]}x{roi.shape[0]} -> {upscaled.shape[1]}x{upscaled.shape[0]}")
+                return upscaled
+            except Exception as e:
+                print(f"[UPSCALE] Error upscaling buffer ROI: {e}, using original")
+                return roi
+        
+        # Функция для предобработки ROI БЕЗ резкости (только для blur detection)
+        def _preprocess_roi_for_blur(roi: np.ndarray) -> np.ndarray:
+            """
+            Применяет предобработку БЕЗ резкости перед blur detection.
+            Порядок: 1) HAT upscale, 2) предобработка (без резкости), 3) blur_score
+            Резкость применяется только для OCR, не для blur detection.
+            """
+            return preprocess_for_ocr(roi, apply_sharpening=False)
+        
+        items = plate_frame_buffer.get_items()
+        selection = select_best_roi_from_buffer(
+            items, 
+            _crop_plate_roi,
+            upscale_fn=_upscale_roi_for_buffer if ENABLE_HAT_UPSCALE and hat_upscaler else None,
+            preprocess_fn=_preprocess_roi_for_blur  # Всегда применяем предобработку перед blur detection
+        )
+        best_roi = selection.get("best_roi")
+        best_frame = selection.get("best_frame")
+        best_score = float(selection.get("best_score") or 0.0)
+        best_source = "buffer"
+
+        def _decode_roi_bytes(raw_bytes: bytes) -> Optional[np.ndarray]:
+            nparr = np.frombuffer(raw_bytes, np.uint8)
+            return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        def _upscale_roi_if_needed(roi: np.ndarray) -> np.ndarray:
+            """Применяет upscale к ROI если включен HAT upscale"""
+            if not ENABLE_HAT_UPSCALE or hat_upscaler is None:
+                return roi
+            try:
+                upscaled = hat_upscaler.enhance(roi)
+                print(f"[UPSCALE] ROI upscaled: {roi.shape[1]}x{roi.shape[0]} -> {upscaled.shape[1]}x{upscaled.shape[0]}")
+                return upscaled
+            except Exception as e:
+                print(f"[UPSCALE] Error upscaling ROI: {e}, using original")
+                return roi
+
+        if license_bytes:
+            license_roi = _decode_roi_bytes(license_bytes)
+            if license_roi is not None:
+                # Правильный порядок: 1) HAT upscale, 2) предобработка БЕЗ резкости, 3) blur_score
+                license_roi_upscaled = _upscale_roi_if_needed(license_roi)
+                license_roi_for_blur = preprocess_for_ocr(license_roi_upscaled, apply_sharpening=False)
+                score = variance_of_laplacian(license_roi_for_blur)
+                if score > best_score:
+                    best_score = score
+                    # Для OCR используем версию С резкостью
+                    best_roi = preprocess_for_ocr(license_roi_upscaled, apply_sharpening=True)
+                    best_source = "license"
+
+        if feature_bytes:
+            feature_roi = _decode_roi_bytes(feature_bytes)
+            if feature_roi is not None:
+                # Правильный порядок: 1) HAT upscale, 2) предобработка БЕЗ резкости, 3) blur_score
+                feature_roi_upscaled = _upscale_roi_if_needed(feature_roi)
+                feature_roi_for_blur = preprocess_for_ocr(feature_roi_upscaled, apply_sharpening=False)
+                score = variance_of_laplacian(feature_roi_for_blur)
+                if score > best_score:
+                    best_score = score
+                    # Для OCR используем версию С резкостью
+                    best_roi = preprocess_for_ocr(feature_roi_upscaled, apply_sharpening=True)
+                    best_source = "feature"
+
+        print(
+            f"[PROCESS] Best ROI source={best_source} blur_score={best_score:.2f} "
+            f"buffer_frames={selection.get('count', 0)} "
+            f"best_ts={selection.get('best_ts')}"
+        )
+        
+        # Логируем топ-5 scores для диагностики
+        if selection.get("scores"):
+            top_scores = selection.get("scores", [])[:5]
+            scores_str = ", ".join([f"{s:.1f}" for s, _ in top_scores])
+            print(f"[PROCESS] Top blur scores: {scores_str}")
+
+        if DEBUG_SAVE and best_roi is not None:
+            try:
+                os.makedirs(DEBUG_SAVE_DIR, exist_ok=True)
+                ts_tag = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                cv2.imwrite(os.path.join(DEBUG_SAVE_DIR, f"roi_raw_{ts_tag}.jpg"), best_roi)
+                if PLR_TRY_PREPROCESSED and best_score < BLUR_THRESHOLD:
+                    pre = preprocess_for_ocr(best_roi)
+                    cv2.imwrite(
+                        os.path.join(DEBUG_SAVE_DIR, f"roi_pre_{ts_tag}.jpg"), pre
+                    )
+                if best_frame is not None:
+                    cv2.imwrite(
+                        os.path.join(DEBUG_SAVE_DIR, f"frame_{ts_tag}.jpg"), best_frame
+                    )
+            except Exception:
+                pass
+
+        # 2) Вызываем Gemini (снег) и используем как fallback для номера
         gemini_result = None
         if snow_photo_bytes and plate_photo_1:
             try:
@@ -469,25 +729,65 @@ async def _process_event_background(
                 )
             except Exception:
                 gemini_result = {"error": "gemini_failed"}
-        
-        # 2. Используем результаты от Gemini
-        final_plate = main_plate
-        if gemini_result and gemini_result.get("plate"):
-            final_plate = gemini_result.get("plate")
-        
+
+        async def _gemini_fallback():
+            return gemini_result
+
+        # 3) Plate Recognizer (если включен)
+        plr_result = await recognize_with_fallback(
+            plr_client=plr_client,
+            plr_enabled=PLR_ENABLED and bool(PLR_TOKEN),
+            plr_regions=PLR_REGIONS,
+            plr_min_score=PLR_MIN_SCORE,
+            try_preprocessed=PLR_TRY_PREPROCESSED and best_score < BLUR_THRESHOLD,
+            best_roi=best_roi,
+            fallback_coro=_gemini_fallback,
+        )
+
+        if plr_result.get("plr_used"):
+            final_plate = plr_result.get("plr_plate")
+            final_conf = float(plr_result.get("plr_score") or 0.0)
+            plate_source = "plr"
+            print(
+                f"[PLR] ✅ Used: plate='{final_plate}' score={final_conf:.3f} "
+                f"latency={plr_result.get('plr_latency_ms', 0):.1f}ms "
+                f"candidates={len(plr_result.get('plr_candidates', []))}"
+            )
+        else:
+            final_plate = main_plate
+            final_conf = float(event_data.get("confidence") or 0.0)
+            if gemini_result and gemini_result.get("plate"):
+                final_plate = gemini_result.get("plate")
+                final_conf = float(gemini_result.get("plate_confidence") or 0.0)
+            plate_source = "gemini"
+            print(
+                f"[PLR] ⚠️ Fallback to {plate_source}: plate='{final_plate}' "
+                f"plr_score={plr_result.get('plr_score', 0.0):.3f} "
+                f"(min_score={PLR_MIN_SCORE:.3f})"
+            )
+
         event_data["plate"] = final_plate
-        
+        event_data["confidence"] = final_conf
+        event_data["plate_source"] = plate_source
+        event_data["plr_plate"] = plr_result.get("plr_plate")
+        event_data["plr_score"] = plr_result.get("plr_score")
+        event_data["plr_used"] = plr_result.get("plr_used")
+        event_data["plr_latency_ms"] = plr_result.get("plr_latency_ms")
+        event_data["plr_candidates"] = plr_result.get("plr_candidates")
+        event_data["blur_score"] = best_score
+        event_data["buffer_frames"] = selection.get("count", 0)
+
         # Процент снега и confidence от Gemini
         snow_percentage = 0.0
         snow_confidence = 0.0
         if gemini_result:
             snow_percentage = gemini_result.get("snow_percentage", 0.0)
             snow_confidence = gemini_result.get("snow_confidence", 0.0)
-        
+
         event_data["snow_volume_percentage"] = snow_percentage
         event_data["snow_volume_confidence"] = snow_confidence
         event_data["matched_snow"] = snow_photo_bytes is not None
-        
+
         if gemini_result:
             event_data["gemini_result"] = gemini_result
         
@@ -627,12 +927,21 @@ async def hikvision_isapi(request: Request):
                             # Логируем номер от модели сразу после распознавания
                             if model_plate:
                                 print(f"[HIK] MODEL DETECTED PLATE: '{model_plate}' (det_conf={model_det_conf}, ocr_conf={model_ocr_conf})")
+                            # Push to ring buffer for best-frame selection
+                            try:
+                                plate_frame_buffer.push(img, ts=time.time(), bbox=model_bbox)
+                            except Exception:
+                                pass
 
                     elif lower_name == "featurepicture.jpg":
-                        feature_bytes = file_bytes
+                        feature_bytes = _maybe_hat_upscale_jpeg(
+                            file_bytes, "featurePicture.jpg"
+                        )
 
                     elif lower_name == "licenseplatepicture.jpg":
-                        license_bytes = file_bytes
+                        license_bytes = _maybe_hat_upscale_jpeg(
+                            file_bytes, "licensePlatePicture.jpg"
+                        )
 
             else:
                 # текстовые части (если будут) — просто логируем
