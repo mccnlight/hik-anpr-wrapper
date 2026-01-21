@@ -17,7 +17,7 @@ from PIL import Image
 
 # Локальный часовой пояс (по умолчанию Astana/UTC+6)
 LOCAL_TZ = timezone(
-    timedelta(hours=int(os.getenv("LOCAL_TZ_OFFSET_HOURS", "6")))
+    timedelta(hours=int(os.getenv("LOCAL_TZ_OFFSET_HOURS", "5")))
 )
 
 # Максимальный возраст события для матчинга (секунды)
@@ -35,6 +35,10 @@ WAIT_FOR_SNOW_SECONDS = float(
 
 # Требовать ли обязательный матч со снегом, иначе не отправлять событие
 REQUIRE_SNOW_MATCH = os.getenv("MERGE_REQUIRE_SNOW_MATCH", "false").lower() == "true"
+
+# Всегда использовать время сервера для матчинга (игнорировать время камеры)
+# Полезно если время на камерах разное или неправильно настроено
+USE_SERVER_TIME_FOR_MATCHING = os.getenv("MERGE_USE_SERVER_TIME", "true").lower() == "true"
 
 
 def _parse_iso_dt(value: str | None) -> Optional[datetime]:
@@ -300,14 +304,22 @@ class EventMerger:
         print(f"[MERGER] DEBUG: current time={now.isoformat()}, anpr_time={anpr_time.isoformat()}, "
               f"anpr_time_diff_from_now={anpr_time_diff_from_now:.1f}s")
         
-        # Если ANPR время сильно отличается от реального (больше чем окно), используем текущее время для матчинга
-        # Это защита от неправильно настроенных часов на камере
-        use_current_time_for_matching = abs(anpr_time_diff_from_now) > self.window.total_seconds()
-        match_time = now if use_current_time_for_matching else anpr_time
-        
-        if use_current_time_for_matching:
-            print(f"[MERGER] WARNING: ANPR time differs from current time by {abs(anpr_time_diff_from_now):.1f}s "
-                  f"(>{self.window.total_seconds()}s), using current time for matching instead of ANPR time")
+        # Определяем какое время использовать для матчинга
+        if USE_SERVER_TIME_FOR_MATCHING:
+            # Всегда используем время сервера (игнорируем время камеры)
+            # Это решает проблему с разным временем на камерах
+            match_time = now
+            print(f"[MERGER] Using server time for matching (USE_SERVER_TIME_FOR_MATCHING=true), "
+                  f"ignoring camera time (diff={anpr_time_diff_from_now:.1f}s)")
+        else:
+            # Старая логика: если ANPR время сильно отличается от реального (больше чем окно), используем текущее время
+            # Это защита от неправильно настроенных часов на камере
+            use_current_time_for_matching = abs(anpr_time_diff_from_now) > self.window.total_seconds()
+            match_time = now if use_current_time_for_matching else anpr_time
+            
+            if use_current_time_for_matching:
+                print(f"[MERGER] WARNING: ANPR time differs from current time by {abs(anpr_time_diff_from_now):.1f}s "
+                      f"(>{self.window.total_seconds()}s), using current time for matching instead of ANPR time")
         
         for idx, snow_event in enumerate(self._snow_events):
             age_from_now = (now - snow_event.event_time).total_seconds()
@@ -445,14 +457,14 @@ class EventMerger:
 
     async def analyze_with_gemini(
         self,
-        snow_photo: bytes,
-        plate_photo_1: bytes,
+        snow_photo: bytes | None,
+        plate_photo_1: bytes | None,
         plate_photo_2: bytes | None,
         camera_plate: str | None = None,
     ) -> Dict[str, Any]:
         """
-        Анализирует 3 фотографии через Gemini:
-        - snow_photo: фото снега (обязательно)
+        Анализирует фотографии через Gemini:
+        - snow_photo: фото снега (опционально, если None - анализирует только номер)
         - plate_photo_1: первое фото номера (обязательно, обычно detectionPicture - обычная фотка)
         - plate_photo_2: второе фото номера (опционально, featurePicture или licensePlatePicture - приближенная фотка)
         - camera_plate: номер от камеры (может быть неверным, нужна дополнительная проверка)
@@ -495,24 +507,51 @@ class EventMerger:
                 "plate_confidence": 0.0,
             }
 
+        if not plate_photo_1:
+            return {
+                "error": "plate_photo_1 is required",
+                "snow_percentage": 0.0,
+                "snow_confidence": 0.0,
+                "plate": None,
+                "plate_confidence": 0.0,
+            }
+
         try:
             import time as time_module
             start_time = time_module.time()
             
             # Загружаем изображения
-            snow_image = Image.open(io.BytesIO(snow_photo)).convert("RGB")
-            plate_image_1 = Image.open(io.BytesIO(plate_photo_1)).convert("RGB")
+            images = []
+            if snow_photo:
+                snow_image = Image.open(io.BytesIO(snow_photo)).convert("RGB")
+                images.append(snow_image)
             
-            images = [snow_image, plate_image_1]
+            plate_image_1 = Image.open(io.BytesIO(plate_photo_1)).convert("RGB")
+            images.append(plate_image_1)
+            
             if plate_photo_2:
                 plate_image_2 = Image.open(io.BytesIO(plate_photo_2)).convert("RGB")
                 images.append(plate_image_2)
             
-            print(f"[GEMINI] Starting analysis: snow_image={snow_image.size}, "
+            print(f"[GEMINI] Starting analysis: snow_image={'present' if snow_photo else 'none'}, "
                   f"plate_image_1={plate_image_1.size}, "
                   f"plate_image_2={'present' if plate_photo_2 else 'none'}")
 
-            image3_text = "IMAGE 3: License plate photo 2 - close-up/zoomed view of the license plate (approximated photo).\n" if plate_photo_2 else ""
+            # Формируем описание изображений
+            image_descriptions = []
+            image_idx = 1
+            if snow_photo:
+                image_descriptions.append(f"IMAGE {image_idx}: Snow photo - shows the cargo bed of a truck.\n")
+                image_idx += 1
+            
+            image_descriptions.append(f"IMAGE {image_idx}: License plate photo 1 - shows the vehicle's license plate (normal/wide view).\n")
+            image_idx += 1
+            
+            if plate_photo_2:
+                image_descriptions.append(f"IMAGE {image_idx}: License plate photo 2 - close-up/zoomed view of the license plate (approximated photo).\n")
+            
+            image_text = "".join(image_descriptions)
+            
             camera_plate_text = ""
             if camera_plate and camera_plate.lower() not in ["unknown", "none", ""]:
                 camera_plate_text = (
@@ -524,35 +563,50 @@ class EventMerger:
                 camera_plate_text = (
                     f"\nIMPORTANT: The camera could not detect a plate number (returned 'unknown'). "
                     "You must carefully read the license plate from the images provided. "
-                    "Look at both IMAGE 2 (normal view) and IMAGE 3 (close-up view if provided) to extract the plate number.\n"
+                    "Look at both license plate photos to extract the plate number.\n"
                 )
             
+            # Формируем задачи в зависимости от наличия снегового фото
+            snow_task = ""
+            if snow_photo:
+                snow_task = (
+                    "1. Analyze IMAGE 1 (snow photo):\n"
+                    "   - Identify the truck that is CLOSEST to the camera (largest in the frame, on the nearest lane).\n"
+                    "   - Analyze ONLY the cargo bed of THIS nearest truck.\n"
+                    "   - Classify ONLY loose/bulk snow inside the OPEN cargo bed of the nearest truck.\n"
+                    "   - Exclude: painted/clean metal or plastic surfaces, tarps, roof/hood, sides of the truck,\n"
+                    "     sun glare, white paint, reflections, frost/ice, road, background, or closed/covered beds.\n"
+                    "   - If the bed of the nearest truck is not clearly visible or is closed/covered/fully outside the frame, set snow_percentage=0 and snow_confidence=0.0.\n"
+                    "   - Snow must look like uneven/loose material with texture; a smooth flat surface (even if white) is NOT snow.\n"
+                    "   - DO NOT analyze snow in trucks that are further away or in the background.\n"
+                    "\n"
+                )
+            
+            plate_image_num = 2 if snow_photo else 1
+            plate_image_num_2 = plate_image_num + 1 if plate_photo_2 else None
+            
             prompt = (
-                "You are analyzing truck photos for snow volume and license plate recognition.\n\n"
-                "IMAGE 1: Snow photo - shows the cargo bed of a truck.\n"
-                "IMAGE 2: License plate photo 1 - shows the vehicle's license plate (normal/wide view).\n"
-                + image3_text +
+                "You are analyzing truck photos for " + ("snow volume and " if snow_photo else "") + "license plate recognition.\n\n"
+                + image_text +
                 camera_plate_text +
                 "\n"
                 "CRITICAL: Focus ONLY on the truck that is CLOSEST to the camera (on the nearest lane). "
                 "If there are multiple trucks in the images, analyze ONLY the one that appears largest/closest. "
                 "Ignore any trucks that are further away or in the background.\n\n"
                 "TASKS:\n"
-                "1. Analyze IMAGE 1 (snow photo):\n"
-                "   - Identify the truck that is CLOSEST to the camera (largest in the frame, on the nearest lane).\n"
-                "   - Analyze ONLY the cargo bed of THIS nearest truck.\n"
-                "   - Classify ONLY loose/bulk snow inside the OPEN cargo bed of the nearest truck.\n"
-                "   - Exclude: painted/clean metal or plastic surfaces, tarps, roof/hood, sides of the truck,\n"
-                "     sun glare, white paint, reflections, frost/ice, road, background, or closed/covered beds.\n"
-                "   - If the bed of the nearest truck is not clearly visible or is closed/covered/fully outside the frame, set snow_percentage=0 and snow_confidence=0.0.\n"
-                "   - Snow must look like uneven/loose material with texture; a smooth flat surface (even if white) is NOT snow.\n"
-                "   - DO NOT analyze snow in trucks that are further away or in the background.\n"
-                "\n"
-                "2. Recognize license plate from IMAGE 2 (and IMAGE 3 if provided):\n"
+                + snow_task +
+                f"{'2' if snow_photo else '1'}. Recognize license plate from IMAGE {plate_image_num}" + (f" (and IMAGE {plate_image_num_2} if provided)" if plate_photo_2 else "") + ":\n"
                 "   - Identify the truck that is CLOSEST to the camera (largest in the frame, on the nearest lane).\n"
                 "   - Extract the license plate number from THIS nearest truck ONLY.\n"
-                "   - You have TWO photos: IMAGE 2 is normal/wide view, IMAGE 3 (if provided) is close-up/zoomed view.\n"
-                "   - Use BOTH photos to get the most accurate result - the close-up (IMAGE 3) usually has better detail.\n"
+            )
+            
+            if plate_photo_2:
+                prompt += (
+                    f"   - You have TWO photos: IMAGE {plate_image_num} is normal/wide view, IMAGE {plate_image_num_2} is close-up/zoomed view.\n"
+                    f"   - Use BOTH photos to get the most accurate result - the close-up (IMAGE {plate_image_num_2}) usually has better detail.\n"
+                )
+            
+            prompt += (
                 "   - Kazakhstan license plate format is STRICT:\n"
                 "     * Format 1: 111AAA11 (3 digits, 3 letters, 2 digits) - example: 035AL115\n"
                 "     * Format 2: 111AA11 (3 digits, 2 letters, 2 digits) - example: 035AL15\n"
@@ -564,14 +618,14 @@ class EventMerger:
                 "   - DO NOT read plates from trucks that are further away or in the background.\n"
                 "\n"
                 "Return JSON with fields:\n"
-                "- snow_percentage: 0.0-100.0 (how full the bed is with snow, 0-100 scale)\n"
-                "- snow_confidence: 0.0-1.0 (confidence in snow analysis)\n"
+                "- snow_percentage: 0.0-100.0 (how full the bed is with snow, 0-100 scale)" + (" - set to 0.0 if snow photo not provided" if not snow_photo else "") + "\n"
+                "- snow_confidence: 0.0-1.0 (confidence in snow analysis)" + (" - set to 0.0 if snow photo not provided" if not snow_photo else "") + "\n"
                 "- plate: string or null (recognized license plate number in format 111AAA11 or 111AA11, or null if not recognized)\n"
                 "- plate_confidence: 0.0-1.0 (confidence in plate recognition)\n\n"
                 "Example:\n"
                 "{\n"
-                '  "snow_percentage": 42.5,\n'
-                '  "snow_confidence": 0.9,\n'
+                '  "snow_percentage": ' + ("42.5" if snow_photo else "0.0") + ",\n"
+                '  "snow_confidence": ' + ("0.9" if snow_photo else "0.0") + ",\n"
                 '  "plate": "035AL115",\n'
                 '  "plate_confidence": 0.85\n'
                 "}\n"
@@ -999,7 +1053,33 @@ class EventMerger:
         plate_value = combined_event.get("plate", "N/A")
         event_time_value = combined_event.get("event_time", "N/A")
         print(f"[MERGER] SENDING EVENT - plate: '{plate_value}' (type: {type(plate_value).__name__})")
-        print(f"[MERGER] SENDING EVENT - event_time: '{event_time_value}' (type: {type(event_time_value).__name__})")
+        print(f"[MERGER] SENDING EVENT - event_time (before conversion): '{event_time_value}' (type: {type(event_time_value).__name__})")
+        
+        # Конвертируем event_time в казахстанское время (UTC+5) перед отправкой на внешний бэкенд
+        try:
+            # Парсим event_time (может быть строкой в формате ISO или уже datetime)
+            if isinstance(event_time_value, str):
+                # Парсим ISO строку
+                if event_time_value.endswith('Z'):
+                    event_time_value = event_time_value[:-1] + '+00:00'
+                dt = datetime.fromisoformat(event_time_value)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                # Уже datetime объект
+                dt = event_time_value
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=LOCAL_TZ)
+            
+            # Конвертируем в локальное время (UTC+5)
+            local_dt = dt.astimezone(LOCAL_TZ)
+            # Форматируем в ISO с timezone offset (например, +05:00)
+            event_time_local = local_dt.isoformat()
+            combined_event["event_time"] = event_time_local
+            print(f"[MERGER] SENDING EVENT - event_time (after conversion to UTC+5): '{event_time_local}'")
+        except Exception as e:
+            print(f"[MERGER] WARNING: failed to convert event_time to local timezone: {e}, using original value")
+        
         print(f"[MERGER] SENDING EVENT - full JSON keys: {list(combined_event.keys())}")
         
         # Проверяем обязательные поля

@@ -11,6 +11,14 @@ import hashlib
 import cv2
 import numpy as np
 
+# Локальный часовой пояс для консистентности с merger
+LOCAL_TZ_OFFSET_HOURS = int(os.getenv("LOCAL_TZ_OFFSET_HOURS", "5"))
+LOCAL_TZ = timezone(timedelta(hours=LOCAL_TZ_OFFSET_HOURS))
+
+def _now_local() -> datetime:
+    """Возвращает текущее время в локальном часовом поясе (консистентно с merger)"""
+    return datetime.now(tz=LOCAL_TZ)
+
 # === Конфиг через переменные окружения ===
 
 SNOW_VIDEO_SOURCE_URL = os.getenv("SNOW_VIDEO_SOURCE_URL", "")
@@ -68,6 +76,7 @@ _snow_thread: threading.Thread | None = None
 _stop_event = threading.Event()
 _cap: cv2.VideoCapture | None = None
 _cap_lock = threading.Lock()
+_merger = None  # EventMerger instance для отправки снеговых событий
 
 # Буфер кадров с временными метками для доступа к прошлым кадрам
 @dataclass
@@ -78,6 +87,21 @@ class TimestampedFrame:
 _frame_buffer: deque[TimestampedFrame] = deque(maxlen=300)  # ~10 секунд при 30 FPS
 _frame_buffer_lock = threading.Lock()
 BUFFER_DURATION_SECONDS = 10.0  # Храним кадры за последние 10 секунд (для задержки до 9.0 сек)
+
+# Трекинг грузовиков для детектирования пересечения линии
+@dataclass
+class TrackedVehicle:
+    track_id: int
+    last_center_x: float
+    last_center_y: float
+    last_timestamp: float
+    crossed_line: bool  # Уже пересек линию (чтобы не создавать дубликаты)
+    size_ratio: float
+    bbox: Tuple[int, int, int, int]
+
+_tracked_vehicles: Dict[int, TrackedVehicle] = {}  # track_id -> TrackedVehicle
+_tracking_lock = threading.Lock()
+_next_track_id = 0
 
 # YOLO модель для детекции грузовиков
 _yolo_model = None
@@ -763,13 +787,127 @@ def _encode_frame_to_jpeg(frame: np.ndarray) -> Tuple[bytes, datetime]:
 
 # === Основной цикл снежной камеры (упрощенный - только чтение потока) ===
 
-def _snow_loop(upstream_url: str):
+def _detect_line_crossing(
+    vehicles: list, 
+    frame_width: int, 
+    frame_height: int,
+    current_timestamp: float
+) -> Optional[Tuple[dict, bytes]]:
     """
-    Упрощенный цикл: читает RTSP поток и сохраняет кадры в буфер с временными метками.
-    Автоматические события больше не создаются - фото делается по запросу через capture_snow_photo().
-    Кадры сохраняются в буфер, чтобы можно было получить кадр из прошлого (когда машина была под снеговой камерой).
+    Детектирует пересечение линии грузовиком.
+    Возвращает (vehicle_info, photo_bytes) если обнаружено пересечение, иначе None.
     """
-    global _cap, _frame_buffer
+    global _tracked_vehicles, _next_track_id, _tracking_lock
+    
+    if not vehicles:
+        return None
+    
+    center_line_px = int(frame_width * CENTER_LINE_X)
+    
+    with _tracking_lock:
+        # Очищаем старые треки (старше 10 секунд)
+        tracks_to_remove = [
+            track_id for track_id, track in _tracked_vehicles.items()
+            if current_timestamp - track.last_timestamp > 10.0
+        ]
+        for track_id in tracks_to_remove:
+            del _tracked_vehicles[track_id]
+        
+        # Ищем пересечение линии для каждой машины
+        for vehicle in vehicles:
+            center_x = vehicle['center_x']
+            center_y = vehicle['center_y']
+            bbox = vehicle['bbox']
+            size_ratio = vehicle['size_ratio']
+            
+            # Фильтр: только большие машины (ближняя полоса) и в центральной зоне
+            if size_ratio < 0.08:  # Только ближняя полоса
+                continue
+            
+            in_zone, _, _, _, _, _, _ = _check_center_zone(bbox, frame_width, frame_height)
+            if not in_zone:
+                continue
+            
+            # Ищем существующий трек (по близости позиции и размеру)
+            best_track = None
+            best_distance = float('inf')
+            
+            for track_id, track in _tracked_vehicles.items():
+                if track.crossed_line:  # Уже пересек - пропускаем
+                    continue
+                
+                # Проверяем близость позиции и размера
+                dist = ((center_x - track.last_center_x) ** 2 + 
+                       (center_y - track.last_center_y) ** 2) ** 0.5
+                size_diff = abs(size_ratio - track.size_ratio)
+                
+                # Если похожий размер и близкая позиция (в пределах 200px) - это тот же трек
+                if size_diff < 0.02 and dist < 200:
+                    if dist < best_distance:
+                        best_distance = dist
+                        best_track = track_id
+            
+            if best_track is not None:
+                # Обновляем трек
+                track = _tracked_vehicles[best_track]
+                last_x = track.last_center_x
+                track.last_center_x = center_x
+                track.last_center_y = center_y
+                track.last_timestamp = current_timestamp
+                track.bbox = bbox
+                track.size_ratio = size_ratio
+                
+                # Проверяем пересечение линии
+                # Пересечение: центр был слева от линии, теперь справа (или наоборот)
+                crossed = False
+                if last_x < center_line_px and center_x >= center_line_px:
+                    # Пересек слева направо
+                    crossed = True
+                elif last_x > center_line_px and center_x <= center_line_px:
+                    # Пересек справа налево (только если разрешено)
+                    if SNOW_ALLOW_R2L_EVENT:
+                        crossed = True
+                
+                if crossed:
+                    track.crossed_line = True
+                    print(f"[SNOW] ✅ Line crossing detected! Track {best_track}, center_x: {last_x:.1f} -> {center_x:.1f}, line={center_line_px}")
+                    
+                    # Кодируем кадр в JPEG
+                    with _frame_buffer_lock:
+                        # Берем последний кадр из буфера (текущий)
+                        if len(_frame_buffer) > 0:
+                            latest_frame = _frame_buffer[-1].frame
+                            ok, buf = cv2.imencode(".jpg", latest_frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                            if ok:
+                                photo_bytes = buf.tobytes()
+                                return (vehicle, photo_bytes)
+            else:
+                # Новый трек - создаем
+                new_track_id = _next_track_id
+                _next_track_id += 1
+                _tracked_vehicles[new_track_id] = TrackedVehicle(
+                    track_id=new_track_id,
+                    last_center_x=center_x,
+                    last_center_y=center_y,
+                    last_timestamp=current_timestamp,
+                    crossed_line=False,
+                    size_ratio=size_ratio,
+                    bbox=bbox
+                )
+    
+    return None
+
+def _snow_loop(upstream_url: str, merger):
+    """
+    Основной цикл снеговой камеры:
+    1. Читает RTSP поток
+    2. Детектирует грузовики (YOLO)
+    3. Трекает их позицию между кадрами
+    4. Детектирует пересечение линии (CENTER_LINE_X)
+    5. При пересечении создает событие и отправляет в merger
+    """
+    global _cap, _frame_buffer, _merger
+    _merger = merger
     
     _cap = cv2.VideoCapture(SNOW_VIDEO_SOURCE_URL, cv2.CAP_FFMPEG)
     if not _cap.isOpened():
@@ -786,7 +924,12 @@ def _snow_loop(upstream_url: str):
     last_log_time = 0.0
     LOG_INTERVAL_SECONDS = 8.0  # Логируем раз в 8 секунд
 
-    print(f"[SNOW] worker started (buffering mode - storing frames for {BUFFER_DURATION_SECONDS}s)")
+    print(f"[SNOW] worker started (line crossing detection mode)")
+    
+    # Получаем YOLO модель
+    model = _get_yolo_model()
+    if model is None:
+        print(f"[SNOW] ERROR: YOLO model not available, line crossing detection disabled")
     
     while not _stop_event.is_set():
         with _cap_lock:
@@ -828,6 +971,42 @@ def _snow_loop(upstream_url: str):
                           f"oldest: {current_timestamp - _frame_buffer[0].timestamp:.2f}s ago, "
                           f"newest: {current_timestamp - _frame_buffer[-1].timestamp:.2f}s ago")
                 last_log_time = current_timestamp
+        
+        # Детектируем грузовики и проверяем пересечение линии
+        if model is not None:
+            try:
+                vehicles = _detect_all_vehicles(frame, model)
+                if vehicles:
+                    fh, fw = frame.shape[:2]
+                    crossing_result = _detect_line_crossing(vehicles, fw, fh, current_timestamp)
+                    
+                    if crossing_result:
+                        vehicle_info, photo_bytes = crossing_result
+                        
+                        # Создаем событие с локальным временем сервера (консистентно с ANPR событиями)
+                        event_time = _now_local()
+                        payload = {
+                            "camera_id": SNOW_CAMERA_ID,
+                            "event_time": event_time.isoformat(),
+                            "event_type": "line_crossing",
+                            "vehicle": {
+                                "bbox": vehicle_info['bbox'],
+                                "center_x": vehicle_info['center_x'],
+                                "center_y": vehicle_info['center_y'],
+                                "size_ratio": vehicle_info['size_ratio'],
+                                "confidence": vehicle_info['conf']
+                            }
+                        }
+                        
+                        # Отправляем в merger
+                        if merger is not None:
+                            merger.add_snow_event(payload, photo_bytes)
+                            print(f"[SNOW] ✅ Snow event created and sent to merger: event_time={event_time.isoformat()}, "
+                                  f"photo_size={len(photo_bytes)} bytes")
+            except Exception as e:
+                print(f"[SNOW] Error in line crossing detection: {e}")
+                import traceback
+                print(f"[SNOW] Traceback: {traceback.format_exc()}")
 
         if SHOW_WINDOW:
             cv2.imshow(window_name, cv2.resize(frame, (960, 540)))
@@ -848,10 +1027,14 @@ def _snow_loop(upstream_url: str):
     print("[SNOW] worker stopped")
 
 
-def start_snow_worker(upstream_url: str):
+def start_snow_worker(upstream_url: str, merger=None):
     """
     Запуск снегового воркера в отдельном потоке.
-    Воркер читает RTSP поток и поддерживает его активным для мгновенного захвата кадров по запросу.
+    Воркер читает RTSP поток, детектирует пересечение линии грузовиками и создает события.
+    
+    Args:
+        upstream_url: URL для отправки событий (не используется напрямую, передается в merger)
+        merger: EventMerger instance для отправки снеговых событий
     """
     global _snow_thread
     if _snow_thread is not None:
@@ -859,11 +1042,13 @@ def start_snow_worker(upstream_url: str):
     if not SNOW_VIDEO_SOURCE_URL:
         print("[SNOW] SNOW_VIDEO_SOURCE_URL is empty, snow worker disabled")
         return
+    if merger is None:
+        print("[SNOW] WARNING: merger is None, snow events will not be created")
 
     _stop_event.clear()
     _snow_thread = threading.Thread(
         target=_snow_loop,
-        args=(upstream_url,),
+        args=(upstream_url, merger),
         daemon=True,
         name="snow-worker",
     )

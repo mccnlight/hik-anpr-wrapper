@@ -279,7 +279,7 @@ async def start_background_workers():
         from snow_worker import start_snow_worker, SNOW_VIDEO_SOURCE_URL
 
         print(f"[STARTUP] snow worker enabled, source={SNOW_VIDEO_SOURCE_URL}")
-        start_snow_worker(UPSTREAM_URL)
+        start_snow_worker(UPSTREAM_URL, merger=merger)
     else:
         print("[STARTUP] snow worker disabled (set ENABLE_SNOW_WORKER=true to enable)")
 
@@ -717,12 +717,15 @@ async def _process_event_background(
             except Exception:
                 pass
 
-        # 2) Вызываем Gemini (снег) и используем как fallback для номера
+        # 2) Вызываем Gemini только для распознавания номера (fallback)
+        # Анализ снега будет выполнен merger.combine_and_send автоматически при матчинге снегового события
         gemini_result = None
-        if snow_photo_bytes and plate_photo_1:
+        if plate_photo_1:
             try:
+                # Вызываем Gemini только для номера (без снега)
+                # Merger.combine_and_send вызовет Gemini для снега автоматически
                 gemini_result = await merger.analyze_with_gemini(
-                    snow_photo=snow_photo_bytes,
+                    snow_photo=None,  # Не передаем снег - merger сделает это сам
                     plate_photo_1=plate_photo_1,
                     plate_photo_2=plate_photo_2,
                     camera_plate=camera_plate_for_gemini,
@@ -791,23 +794,29 @@ async def _process_event_background(
         if gemini_result:
             event_data["gemini_result"] = gemini_result
         
-        # 3. Отправляем на upstream со всеми фотографиями
-        print(f"[PROCESS] Sending to upstream: snow_bytes={'present' if snow_photo_bytes else 'None'} ({len(snow_photo_bytes) if snow_photo_bytes else 0} bytes)")
-        upstream_result = await send_to_upstream(
-            event_data=event_data,
+        # 3. Отправляем через merger.combine_and_send (автоматически матчит снеговые события)
+        # Merger автоматически найдет соответствующее снеговое событие по времени и отправит объединенное событие
+        print(f"[PROCESS] Sending via merger.combine_and_send (will auto-match snow event)")
+        upstream_result = await merger.combine_and_send(
+            anpr_event=event_data,
             detection_bytes=detection_bytes,
             feature_bytes=feature_bytes,
             license_bytes=license_bytes,
-            snow_bytes=snow_photo_bytes,
         )
+        
+        # Обновляем event_data с результатами от merger (snow_percentage, snow_confidence)
+        if upstream_result.get("matched_snow"):
+            # Merger уже добавил snow_volume_percentage и snow_volume_confidence в combined_event
+            # Но мы не имеем доступа к combined_event, поэтому оставляем значения из Gemini
+            pass
         
         # 4. Логируем в detections.log (тихо, без print)
         log_event = {
             **event_data,
-            "upstream_sent": upstream_result["sent"],
-            "upstream_status": upstream_result["status"],
-            "upstream_error": upstream_result["error"],
-            "snow_photo_captured": snow_photo_bytes is not None,
+            "upstream_sent": upstream_result.get("sent", False),
+            "upstream_status": upstream_result.get("status"),
+            "upstream_error": upstream_result.get("error"),
+            "matched_snow": upstream_result.get("matched_snow", False),
         }
         
         log_path = BASE_DIR / "detections.log"
@@ -895,25 +904,12 @@ async def hikvision_isapi(request: Request):
                         detection_bytes = file_bytes
                         print(f"[HIK] ✅ Received detectionPicture.jpg, size={len(detection_bytes)} bytes")
                         
-                        # КРИТИЧНО: Захватываем фото снега СРАЗУ после получения detectionPicture
-                        # Используем его для поиска похожей машины на снеговом кадре
+                        # Снеговое фото теперь захватывается автоматически при пересечении линии
+                        # Merger автоматически матчит события по времени
+                        # Здесь просто инициализируем переменную (будет заполнена в merger при матчинге)
+                        snow_photo_bytes = None
                         if ENABLE_SNOW_WORKER:
-                            print(f"[HIK] ENABLE_SNOW_WORKER={ENABLE_SNOW_WORKER}, attempting to capture snow photo...")
-                            try:
-                                from snow_worker import capture_snow_photo
-                                print(f"[HIK] Calling capture_snow_photo with ANPR image (size={len(detection_bytes)} bytes)...")
-                                snow_photo_bytes = capture_snow_photo(anpr_vehicle_image_bytes=detection_bytes)
-                                if snow_photo_bytes:
-                                    print(f"[HIK] ✅ Snow photo captured with ANPR matching, size={len(snow_photo_bytes)} bytes")
-                                else:
-                                    print(f"[HIK] ⚠️ WARNING: Snow photo capture returned None")
-                            except Exception as e:
-                                print(f"[HIK] ❌ ERROR capturing snow photo: {e}")
-                                import traceback
-                                print(f"[HIK] Traceback: {traceback.format_exc()}")
-                                snow_photo_bytes = None
-                        else:
-                            print(f"[HIK] ⚠️ ENABLE_SNOW_WORKER is False, skipping snow photo capture")
+                            print(f"[HIK] ENABLE_SNOW_WORKER={ENABLE_SNOW_WORKER}, snow events are created automatically on line crossing")
 
                         # Гоняем через наш ANPR
                         np_arr = np.frombuffer(file_bytes, np.uint8)
@@ -963,18 +959,30 @@ async def hikvision_isapi(request: Request):
         camera_conf = camera_info.get("confidence")
         
         # Парсим event_time из камеры или используем текущее время
-        event_time_str = camera_info.get("date_time")
-        if event_time_str:
-            # Пытаемся распарсить время от камеры
-            try:
-                # Если камера отправляет без timezone, добавляем UTC
-                if 'Z' not in event_time_str and '+' not in event_time_str:
-                    event_time_str = event_time_str + 'Z'
-                event_time = event_time_str
-            except Exception:
-                event_time = now_iso
-        else:
+        # Если включена опция USE_SERVER_TIME, всегда используем время сервера (игнорируем время камеры)
+        USE_SERVER_TIME = os.getenv("MERGE_USE_SERVER_TIME", "true").lower() == "true"
+        
+        if USE_SERVER_TIME:
+            # Всегда используем время сервера (игнорируем время камеры)
+            # Это решает проблему с разным временем на камерах
             event_time = now_iso
+            camera_time_str = camera_info.get("date_time")
+            if camera_time_str:
+                print(f"[HIK] Using server time for event_time (ignoring camera time: '{camera_time_str}')")
+        else:
+            # Старая логика: используем время камеры если есть
+            event_time_str = camera_info.get("date_time")
+            if event_time_str:
+                # Пытаемся распарсить время от камеры
+                try:
+                    # Если камера отправляет без timezone, добавляем UTC
+                    if 'Z' not in event_time_str and '+' not in event_time_str:
+                        event_time_str = event_time_str + 'Z'
+                    event_time = event_time_str
+                except Exception:
+                    event_time = now_iso
+            else:
+                event_time = now_iso
 
         # Выбираем основной номер: камера приоритетна, модель — только если валидна.
         main_plate, plate_reason = await choose_plate(camera_plate, model_plate)
