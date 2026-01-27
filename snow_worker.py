@@ -46,7 +46,12 @@ STATIONARY_HARD_TIMEOUT_SECONDS = float(os.getenv("SNOW_STATIONARY_HARD_TIMEOUT_
 LEAVE_RESET_THRESHOLD = int(os.getenv("SNOW_LEAVE_RESET_THRESHOLD", "12"))  # Сколько кадров подряд без детекта считать, что машина ушла
 SNOW_ALLOW_R2L_EVENT = os.getenv("SNOW_ALLOW_R2L_EVENT", "false").lower() == "true"  # Разрешать событие даже при движении R→L
 
-SHOW_WINDOW = False
+# Окно предпросмотра (включаем через переменную окружения SNOW_SHOW_WINDOW=true)
+SHOW_WINDOW = os.getenv("SNOW_SHOW_WINDOW", "false").strip().lower() == "true"
+
+# Настройки динамического квадрата вокруг грузовика (для превью-окна)
+SQUARE_SCALE = float(os.getenv("SNOW_SQUARE_SCALE", "1.2"))  # Во сколько раз квадрат больше bbox по большей стороне
+SQUARE_MIN_SIZE = int(os.getenv("SNOW_SQUARE_MIN_SIZE", "60"))  # Минимальный размер квадрата в пикселях
 
 # Принудительно настраиваем FFMPEG backend: TCP, таймаут ~5с, небольшой буфер, тихий лог FFmpeg
 os.environ.setdefault(
@@ -95,6 +100,81 @@ _yolo_model_lock = threading.Lock()
 _detection_cache: Dict[float, Tuple[float, Optional[Tuple[int, int, int, int]]]] = {}
 _detection_cache_lock = threading.Lock()
 DETECTION_CACHE_TTL = 30.0  # Кэш живет 30 секунд
+
+
+def _make_dynamic_square(
+    bbox: Tuple[int, int, int, int],
+    frame_width: int,
+    frame_height: int,
+    scale: float = SQUARE_SCALE,
+    min_size: int = SQUARE_MIN_SIZE,
+) -> Tuple[int, int, int, int]:
+    """
+    Строит «динамический квадрат» вокруг bbox:
+    - квадрат всегда содержит грузовик;
+    - чем ближе грузовик (больше bbox), тем больше квадрат;
+    - чем дальше грузовик (меньше bbox), тем меньше квадрат, но не ниже min_size;
+    - квадрат не выходит за границы кадра.
+    """
+    x1, y1, x2, y2 = bbox
+    w = max(1, x2 - x1)
+    h = max(1, y2 - y1)
+
+    # Берём большую сторону bbox и домножаем на коэффициент
+    base_size = max(w, h)
+    size = int(max(base_size * scale, min_size))
+
+    cx = x1 + w // 2
+    cy = y1 + h // 2
+
+    half = size // 2
+    sx1 = max(0, cx - half)
+    sy1 = max(0, cy - half)
+    sx2 = min(frame_width - 1, cx + half)
+    sy2 = min(frame_height - 1, cy + half)
+
+    # На случай сильного обрезания по краям — гарантируем, что квадрат не схлопнулся
+    if sx2 <= sx1:
+        sx2 = min(frame_width - 1, sx1 + 1)
+    if sy2 <= sy1:
+        sy2 = min(frame_height - 1, sy1 + 1)
+
+    return sx1, sy1, sx2, sy2
+
+
+def _estimate_cargo_bbox(truck_bbox: Tuple[int, int, int, int], class_id: int) -> Optional[Tuple[int, int, int, int]]:
+    """
+    Оценивает bbox кузова грузовика на основе bbox всего грузовика.
+    Для самосвалов кузов - это задняя часть грузовика, выше кабины.
+    """
+    x1, y1, x2, y2 = truck_bbox
+    w = x2 - x1
+    h = y2 - y1
+    
+    # Для грузовиков (класс 7) кузов обычно в задней части, выше кабины
+    if class_id == TRUCK_CLASS_ID:
+        # Кузов занимает задние 60-70% длины грузовика (задняя часть)
+        cargo_start_x = x1 + int(w * 0.30)  # Начинается с 30% от начала
+        cargo_end_x = x2  # До конца грузовика
+        
+        # Кузов по высоте: начинается примерно с 30% от верха, занимает 35% высоты
+        # Это верхняя часть задней части грузовика (выше кабины)
+        cargo_start_y = y1 + int(h * 0.30)  # Начинается с 30% от верха
+        cargo_height = int(h * 0.35)  # Занимает 35% высоты (уменьшено, чтобы не выходил слишком высоко)
+        cargo_end_y = cargo_start_y + cargo_height
+        
+        # Ограничиваем границами исходного bbox
+        cargo_start_x = max(x1, cargo_start_x)
+        cargo_end_x = min(x2, cargo_end_x)
+        cargo_start_y = max(y1, cargo_start_y)
+        cargo_end_y = min(y2, cargo_end_y)
+        
+        # Проверяем, что кузов не пустой
+        if cargo_end_x > cargo_start_x and cargo_end_y > cargo_start_y:
+            return (cargo_start_x, cargo_start_y, cargo_end_x, cargo_end_y)
+    
+    # Для автобусов и машин кузов = весь bbox (или можно не выделять)
+    return None
 
 
 # === Функция захвата фото по запросу ===
@@ -154,6 +234,65 @@ def _detect_all_vehicles(frame: np.ndarray, model) -> list:
                 })
     except Exception as e:
         print(f"[SNOW] Error in YOLO detection: {e}")
+        return []
+    
+    return all_vehicles
+
+def _detect_all_vehicles_for_preview(frame: np.ndarray, model) -> list:
+    """
+    Детектирует ВСЕ грузовики и большие транспортные средства для предпросмотра с МЯГКИМИ фильтрами.
+    Показывает даже маленькие и далёкие грузовики.
+    """
+    if model is None:
+        return []
+    
+    fh, fw = frame.shape[:2]
+    all_vehicles = []
+    
+    # Мягкие фильтры для предпросмотра - показываем ВСЁ что детектируется
+    PREVIEW_MIN_CONF = 0.25  # Низкий порог уверенности
+    PREVIEW_MIN_AREA = 500   # Очень маленький минимум площади
+    PREVIEW_MIN_W = 20       # Минимальная ширина всего 20px
+    PREVIEW_MIN_H = 20       # Минимальная высота всего 20px
+    
+    # Классы для детекции: грузовик (7), автобус (5), и другие большие транспортные средства
+    # В YOLO COCO: 2=car, 3=motorcycle, 5=bus, 7=truck
+    PREVIEW_VEHICLE_CLASSES = [TRUCK_CLASS_ID, 5, 2]  # грузовик, автобус, машина
+    
+    try:
+        results = model(frame, verbose=False)
+        for r in results:
+            boxes = r.boxes
+            if boxes is None:
+                continue
+            for b in boxes:
+                cls_id = int(b.cls[0].item())
+                conf = float(b.conf[0].item())
+                # Для предпросмотра показываем грузовики, автобусы и машины с мягким порогом
+                if cls_id not in PREVIEW_VEHICLE_CLASSES or conf < PREVIEW_MIN_CONF:
+                    continue
+                x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
+                w = x2 - x1
+                h = y2 - y1
+                area = w * h
+                
+                # Мягкие фильтры по размеру - только чтобы отсечь совсем мусор
+                if area < PREVIEW_MIN_AREA or w < PREVIEW_MIN_W or h < PREVIEW_MIN_H:
+                    continue
+                
+                all_vehicles.append({
+                    'bbox': (x1, y1, x2, y2),
+                    'area': area,
+                    'size_ratio': area / (fw * fh),
+                    'center_x': (x1 + x2) / 2.0,
+                    'center_y': (y1 + y2) / 2.0,
+                    'conf': conf,
+                    'class_id': cls_id
+                })
+    except Exception as e:
+        print(f"[SNOW] Error in preview YOLO detection: {e}")
+        import traceback
+        print(f"[SNOW] Traceback: {traceback.format_exc()}")
         return []
     
     return all_vehicles
@@ -856,100 +995,141 @@ def _snow_loop():
             #               f"newest: {current_timestamp - _frame_buffer[-1].timestamp:.2f}s ago")
             #     last_log_time = current_timestamp
 
+        # Сразу считаем детекцию грузовиков для текущего кадра
+        quality_score = 0.0
+        bbox = None
+        vehicles_count = 0
+        all_veh = []
+        model = None
+        try:
+            h, w = frame.shape[:2]
+            model = _get_yolo_model()
+            if model is not None:
+                quality_score, bbox, vehicles_count, all_veh = _assess_frame_quality(frame, time.time(), model)
+            if quality_score <= 0 or not bbox:
+                last_bbox = None
+            else:
+                last_bbox = bbox
+        except Exception:
+            # В случае любой ошибки детекции — просто показываем кадр без рамок
+            quality_score = 0.0
+            bbox = None
+            vehicles_count = 0
+            all_veh = []
+
+        # Отрисовка окна предпросмотра, если включено
         if SHOW_WINDOW:
             vis = frame.copy()
             # рисуем линию
             lx1, ly1, lx2, ly2 = line_norm
-            h, w = vis.shape[:2]
+            vh, vw = vis.shape[:2]
             cv2.line(
                 vis,
-                (int(lx1 * w), int(ly1 * h)),
-                (int(lx2 * w), int(ly2 * h)),
+                (int(lx1 * vw), int(ly1 * vh)),
+                (int(lx2 * vw), int(ly2 * vh)),
                 (0, 255, 255),
                 2,
                 lineType=cv2.LINE_AA,
             )
-            # рисуем bbox последней машины
-            if last_bbox:
-                x1, y1, x2, y2 = last_bbox
-                cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 200, 0), 2)
+
+            # динамические квадраты вокруг ВСЕХ найденных грузовиков
+            # Для предпросмотра ВСЕГДА используем детекцию с мягкими фильтрами,
+            # чтобы показать ВСЕ грузовики, даже маленькие и далёкие
+            det_vehicles = []
+            if model is not None:
+                try:
+                    det_vehicles = _detect_all_vehicles_for_preview(vis, model)
+                    # Отладочный вывод (можно убрать после проверки)
+                    if det_vehicles:
+                        print(f"[SNOW-PREVIEW] Found {len(det_vehicles)} trucks for preview")
+                except Exception as e:
+                    print(f"[SNOW-PREVIEW] Error detecting for preview: {e}")
+                    det_vehicles = []
+
+            # Рисуем зелёные квадраты вокруг ВСЕХ найденных грузовиков
+            for veh in det_vehicles:
+                vbbox = veh.get("bbox")
+                class_id = veh.get("class_id", -1)
+                if not vbbox:
+                    continue
+                # Рисуем динамический квадрат вокруг всего грузовика (зелёный)
+                sx1, sy1, sx2, sy2 = _make_dynamic_square(vbbox, vw, vh)
+                cv2.rectangle(vis, (sx1, sy1), (sx2, sy2), (0, 255, 0), 3)
+                
+                # Для грузовиков дополнительно выделяем кузов (синий квадрат)
+                if class_id == TRUCK_CLASS_ID:
+                    cargo_bbox = _estimate_cargo_bbox(vbbox, class_id)
+                    if cargo_bbox:
+                        # Рисуем динамический квадрат вокруг кузова (синий, тонкая линия)
+                        csx1, csy1, csx2, csy2 = _make_dynamic_square(cargo_bbox, vw, vh)
+                        cv2.rectangle(vis, (csx1, csy1), (csx2, csy2), (255, 0, 0), 2)
+
             cv2.imshow(window_name, cv2.resize(vis, (960, 540)))
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q") or key == 27:
                 _stop_event.set()
                 break
 
+        # Проверяем пересечение линии для лучшей машины (как и раньше)
+        try:
+            if bbox:
+                x1, y1, x2, y2 = bbox
+                cx = (x1 + x2) // 2
+                cy = (y1 + y2) // 2
+
+                # Вычисляем сторону относительно линии
+                lx1, ly1, lx2, ly2 = line_norm
+                ax = lx1 * w
+                ay = ly1 * h
+                bx = lx2 * w
+                by = ly2 * h
+                cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+                side = 1 if cross > 0 else -1
+
+                # Направление: forward = слева->справа относительно A->B, backward наоборот
+                allowed = False
+                if last_side is None:
+                    last_side = side
+                elif side != last_side:
+                    if LINE_DIRECTION == "any":
+                        allowed = True
+                    elif LINE_DIRECTION == "forward" and last_side > 0 and side < 0:
+                        allowed = True
+                    elif LINE_DIRECTION == "backward" and last_side < 0 and side > 0:
+                        allowed = True
+
+                if allowed and (time.time() - last_trigger_ts) > 1.0:
+                    last_trigger_ts = time.time()
+                    last_side = side
+                    try:
+                        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                        if ok:
+                            photo_bytes = buf.tobytes()
+                            payload = {
+                                "event_time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                                "camera_id": SNOW_CAMERA_ID,
+                                "bbox": bbox,
+                                "line": {
+                                    "x1": LINE_X1,
+                                    "y1": LINE_Y1,
+                                    "x2": LINE_X2,
+                                    "y2": LINE_Y2,
+                                    "direction": LINE_DIRECTION,
+                                },
+                            }
+                            if _merger:
+                                _merger.add_snow_event(payload, photo_bytes)
+                                print(f"[SNOW] line crossed, snow event pushed to merger, bytes={len(photo_bytes)}")
+                    except Exception as e:
+                        print(f"[SNOW] error on line crossing capture: {e}")
+                else:
+                    last_side = side
+        except Exception:
+            pass
+
         # Небольшая пауза, чтобы не грузить CPU
         time.sleep(0.01)
         frame_counter += 1
-
-        # Проверяем пересечение линии каждые кадр
-        try:
-            h, w = frame.shape[:2]
-            # Достаём лучшую машину (по качеству) и центр
-            model = _get_yolo_model()
-            if model is None:
-                continue
-            quality_score, bbox, vehicles_count, all_veh = _assess_frame_quality(frame, time.time(), model)
-            if quality_score <= 0 or not bbox:
-                last_bbox = None
-                continue
-            x1, y1, x2, y2 = bbox
-            last_bbox = bbox
-            cx = (x1 + x2) // 2
-            cy = (y1 + y2) // 2
-
-            # Вычисляем сторону относительно линии
-            lx1, ly1, lx2, ly2 = line_norm
-            ax = lx1 * w
-            ay = ly1 * h
-            bx = lx2 * w
-            by = ly2 * h
-            cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
-            side = 1 if cross > 0 else -1
-
-            # Направление: forward = слева->справа относительно A->B, backward наоборот
-            allowed = False
-            if last_side is None:
-                last_side = side
-                continue
-            if side != last_side:
-                if LINE_DIRECTION == "any":
-                    allowed = True
-                elif LINE_DIRECTION == "forward" and last_side > 0 and side < 0:
-                    allowed = True
-                elif LINE_DIRECTION == "backward" and last_side < 0 and side > 0:
-                    allowed = True
-
-            if allowed and (time.time() - last_trigger_ts) > 1.0:
-                last_trigger_ts = time.time()
-                last_side = side
-                try:
-                    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
-                    if not ok:
-                        continue
-                    photo_bytes = buf.tobytes()
-                    payload = {
-                        "event_time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                        "camera_id": SNOW_CAMERA_ID,
-                        "bbox": bbox,
-                        "line": {
-                            "x1": LINE_X1,
-                            "y1": LINE_Y1,
-                            "x2": LINE_X2,
-                            "y2": LINE_Y2,
-                            "direction": LINE_DIRECTION,
-                        },
-                    }
-                    if _merger:
-                        _merger.add_snow_event(payload, photo_bytes)
-                        print(f"[SNOW] line crossed, snow event pushed to merger, bytes={len(photo_bytes)}")
-                except Exception as e:
-                    print(f"[SNOW] error on line crossing capture: {e}")
-            else:
-                last_side = side
-        except Exception:
-            pass
 
     with _cap_lock:
         if _cap is not None:

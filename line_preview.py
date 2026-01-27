@@ -26,7 +26,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Tuple, Optional
 
 import cv2
 import numpy as np
@@ -63,6 +63,19 @@ LINE_Y2 = float(os.getenv("LINE_Y2", str(DEFAULT_LINE[3])))
 STEP_SMALL = 0.005
 STEP_BIG = 0.02
 
+# Настройки детекции грузовиков
+TRUCK_CLASS_ID = int(os.getenv("SNOW_TRUCK_CLASS_ID", "7"))
+YOLO_MODEL_PATH = os.getenv("SNOW_YOLO_MODEL_PATH", "yolov8n.pt")
+PREVIEW_MIN_CONF = 0.25  # Мягкий порог для предпросмотра
+PREVIEW_MIN_AREA = 500   # Минимальная площадь
+PREVIEW_MIN_W = 20       # Минимальная ширина
+PREVIEW_MIN_H = 20       # Минимальная высота
+SQUARE_SCALE = float(os.getenv("SNOW_SQUARE_SCALE", "1.2"))
+SQUARE_MIN_SIZE = int(os.getenv("SNOW_SQUARE_MIN_SIZE", "60"))
+
+# Глобальная переменная для YOLO модели
+_yolo_model = None
+
 
 @dataclass
 class LineState:
@@ -94,12 +107,155 @@ def _reload_env(state: LineState) -> None:
     )
 
 
+def _get_yolo_model():
+    """Ленивая инициализация YOLO модели"""
+    global _yolo_model
+    if _yolo_model is None:
+        try:
+            from ultralytics import YOLO
+            if os.path.exists(YOLO_MODEL_PATH):
+                _yolo_model = YOLO(YOLO_MODEL_PATH)
+                print(f"[LINE-PREVIEW] YOLO model loaded: {YOLO_MODEL_PATH}")
+            else:
+                print(f"[LINE-PREVIEW] WARNING: YOLO model not found at {YOLO_MODEL_PATH}")
+        except ImportError:
+            print("[LINE-PREVIEW] WARNING: ultralytics not installed, truck detection disabled")
+        except Exception as e:
+            print(f"[LINE-PREVIEW] ERROR: Failed to load YOLO model: {e}")
+    return _yolo_model
+
+
+def _detect_trucks_for_preview(frame: np.ndarray, model) -> list:
+    """Детектирует грузовики для предпросмотра с мягкими фильтрами"""
+    if model is None:
+        return []
+    
+    fh, fw = frame.shape[:2]
+    vehicles = []
+    
+    # Классы для детекции: грузовик (7), автобус (5), машина (2)
+    PREVIEW_VEHICLE_CLASSES = [TRUCK_CLASS_ID, 5, 2]
+    
+    try:
+        results = model(frame, verbose=False)
+        for r in results:
+            boxes = r.boxes
+            if boxes is None:
+                continue
+            for b in boxes:
+                cls_id = int(b.cls[0].item())
+                conf = float(b.conf[0].item())
+                if cls_id not in PREVIEW_VEHICLE_CLASSES or conf < PREVIEW_MIN_CONF:
+                    continue
+                x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
+                w = x2 - x1
+                h = y2 - y1
+                area = w * h
+                
+                if area < PREVIEW_MIN_AREA or w < PREVIEW_MIN_W or h < PREVIEW_MIN_H:
+                    continue
+                
+                vehicles.append({
+                    'bbox': (x1, y1, x2, y2),
+                    'conf': conf,
+                    'class_id': cls_id
+                })
+    except Exception as e:
+        print(f"[LINE-PREVIEW] Error in truck detection: {e}")
+        return []
+    
+    return vehicles
+
+
+def _make_dynamic_square(bbox: Tuple[int, int, int, int], frame_width: int, frame_height: int) -> Tuple[int, int, int, int]:
+    """Создаёт динамический квадрат вокруг bbox"""
+    x1, y1, x2, y2 = bbox
+    w = max(1, x2 - x1)
+    h = max(1, y2 - y1)
+    
+    base_size = max(w, h)
+    size = int(max(base_size * SQUARE_SCALE, SQUARE_MIN_SIZE))
+    
+    cx = x1 + w // 2
+    cy = y1 + h // 2
+    
+    half = size // 2
+    sx1 = max(0, cx - half)
+    sy1 = max(0, cy - half)
+    sx2 = min(frame_width - 1, cx + half)
+    sy2 = min(frame_height - 1, cy + half)
+    
+    if sx2 <= sx1:
+        sx2 = min(frame_width - 1, sx1 + 1)
+    if sy2 <= sy1:
+        sy2 = min(frame_height - 1, sy1 + 1)
+    
+    return sx1, sy1, sx2, sy2
+
+
+def _estimate_cargo_bbox(truck_bbox: Tuple[int, int, int, int], class_id: int) -> Optional[Tuple[int, int, int, int]]:
+    """
+    Оценивает bbox кузова грузовика на основе bbox всего грузовика.
+    Для самосвалов кузов - это задняя часть грузовика, выше кабины.
+    """
+    x1, y1, x2, y2 = truck_bbox
+    w = x2 - x1
+    h = y2 - y1
+    
+    # Для грузовиков (класс 7) кузов обычно в задней части, выше кабины
+    if class_id == TRUCK_CLASS_ID:
+        # Кузов занимает задние 60-70% длины грузовика (задняя часть)
+        cargo_start_x = x1 + int(w * 0.30)  # Начинается с 30% от начала
+        cargo_end_x = x2  # До конца грузовика
+        
+        # Кузов по высоте: начинается примерно с 30% от верха, занимает 35% высоты
+        # Это верхняя часть задней части грузовика (выше кабины)
+        cargo_start_y = y1 + int(h * 0.30)  # Начинается с 30% от верха
+        cargo_height = int(h * 0.35)  # Занимает 35% высоты (уменьшено, чтобы не выходил слишком высоко)
+        cargo_end_y = cargo_start_y + cargo_height
+        
+        # Ограничиваем границами исходного bbox
+        cargo_start_x = max(x1, cargo_start_x)
+        cargo_end_x = min(x2, cargo_end_x)
+        cargo_start_y = max(y1, cargo_start_y)
+        cargo_end_y = min(y2, cargo_end_y)
+        
+        # Проверяем, что кузов не пустой
+        if cargo_end_x > cargo_start_x and cargo_end_y > cargo_start_y:
+            return (cargo_start_x, cargo_start_y, cargo_end_x, cargo_end_y)
+    
+    # Для автобусов и машин кузов = весь bbox (или можно не выделять)
+    return None
+
+
 def _draw_overlay(frame: np.ndarray, state: LineState, selected_point: str, fps: float) -> np.ndarray:
     h, w = frame.shape[:2]
     x1_px, y1_px = int(state.x1 * w), int(state.y1 * h)
     x2_px, y2_px = int(state.x2 * w), int(state.y2 * h)
 
     out = frame.copy()
+    
+    # Детектируем грузовики и рисуем квадраты
+    model = _get_yolo_model()
+    if model is not None:
+        trucks = _detect_trucks_for_preview(out, model)
+        for truck in trucks:
+            bbox = truck.get('bbox')
+            class_id = truck.get('class_id', -1)
+            if bbox:
+                # Рисуем динамический квадрат вокруг всего грузовика (зелёный)
+                sx1, sy1, sx2, sy2 = _make_dynamic_square(bbox, w, h)
+                cv2.rectangle(out, (sx1, sy1), (sx2, sy2), (0, 255, 0), 3)
+                
+                # Для грузовиков дополнительно выделяем кузов (синий квадрат)
+                if class_id == TRUCK_CLASS_ID:
+                    cargo_bbox = _estimate_cargo_bbox(bbox, class_id)
+                    if cargo_bbox:
+                        # Рисуем динамический квадрат вокруг кузова (синий, тонкая линия)
+                        csx1, csy1, csx2, csy2 = _make_dynamic_square(cargo_bbox, w, h)
+                        cv2.rectangle(out, (csx1, csy1), (csx2, csy2), (255, 0, 0), 2)
+    
+    # Рисуем линию
     cv2.line(out, (x1_px, y1_px), (x2_px, y2_px), (0, 255, 255), 2, lineType=cv2.LINE_AA)
     cv2.circle(out, (x1_px, y1_px), 6, (0, 200, 255), -1, lineType=cv2.LINE_AA)
     cv2.circle(out, (x2_px, y2_px), 6, (0, 120, 255), 1, lineType=cv2.LINE_AA)
