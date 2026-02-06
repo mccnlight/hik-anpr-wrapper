@@ -455,18 +455,34 @@ async def _process_event_background(
                 gemini_result = {"error": "gemini_failed"}
         
         # 2. Используем результаты от Gemini
+        # ВАЖНО: Если plate_source начинается с "camera" (т.е. номер уже выбран из камеры),
+        # НЕ перезаписываем его результатом Gemini. Итоговый plate должен остаться camera_plate.
         final_plate = main_plate
-        if gemini_result and gemini_result.get("plate"):
-            final_plate = gemini_result.get("plate")
+        plate_source = event_data.get("plate_source", "")
+        
+        # Проверяем, был ли номер выбран из камеры
+        is_camera_plate = (plate_source and plate_source.startswith("camera")) or (camera_plate_for_gemini and camera_plate_for_gemini.lower() not in ["unknown", "none", ""])
+        
+        if is_camera_plate:
+            # Номер уже от камеры - НЕ перезаписываем его результатом Gemini
+            final_plate = main_plate
+            print(f"[PROCESS] Keeping camera plate '{final_plate}' (plate_source='{plate_source}'), ignoring Gemini plate")
+        elif gemini_result and gemini_result.get("model_plate"):
+            # Номер не от камеры - можем использовать результат Gemini
+            final_plate = gemini_result.get("model_plate")
+            print(f"[PROCESS] Using Gemini plate '{final_plate}' (no camera plate)")
         
         event_data["plate"] = final_plate
         
         # Процент снега и confidence от Gemini
         snow_percentage = 0.0
         snow_confidence = 0.0
-        if gemini_result:
-            snow_percentage = gemini_result.get("snow_percentage", 0.0)
-            snow_confidence = gemini_result.get("snow_confidence", 0.0)
+        if gemini_result and "error" not in gemini_result:
+            snow_percentage = float(gemini_result.get("snow_percentage", 0.0))
+            snow_confidence = float(gemini_result.get("snow_confidence", 0.0))
+            print(f"[PROCESS] Gemini parsed OK: snow={snow_percentage} conf={snow_confidence}")
+        elif gemini_result and "error" in gemini_result:
+            print(f"[PROCESS] Gemini error: {gemini_result.get('error', 'unknown')}")
         
         event_data["snow_volume_percentage"] = snow_percentage
         event_data["snow_volume_confidence"] = snow_confidence

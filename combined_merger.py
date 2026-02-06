@@ -5,6 +5,7 @@ import threading
 import time
 import hashlib
 import asyncio  # нужен для ожидания снеговых событий, если ANPR пришел раньше
+import re
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -73,6 +74,84 @@ def _parse_iso_dt(value: str | None) -> Optional[datetime]:
 def _now() -> datetime:
     """Возвращает текущее время в локальном часовом поясе (по умолчанию UTC+6 Astana)."""
     return datetime.now(tz=LOCAL_TZ)
+
+
+def _extract_json_from_text(text: str, max_length: int = 200 * 1024) -> Optional[Dict[str, Any]]:
+    """
+    Надежное извлечение JSON из текста, который может содержать markdown, лишний текст, или JSON внутри строки.
+    
+    Стратегия:
+    1. Сначала ищем fenced code block ```json ... ```
+    2. Потом ищем первый валидный JSON-объект по стратегии: найти первую '{' и подобрать корректную закрывающую '}'
+       с учётом вложенности и строк (скобки внутри строк игнорировать).
+    3. Ограничиваем максимальную длину candidate, чтобы не съесть память.
+    """
+    if not text:
+        return None
+    
+    # Ограничиваем длину входного текста
+    if len(text) > max_length:
+        text = text[:max_length]
+    
+    # Шаг 1: Ищем fenced code block ```json ... ```
+    json_block_pattern = r'```(?:json)?\s*\n?(.*?)\n?```'
+    matches = re.finditer(json_block_pattern, text, re.DOTALL | re.IGNORECASE)
+    for match in matches:
+        candidate = match.group(1).strip()
+        if candidate:
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+    
+    # Шаг 2: Ищем первый валидный JSON-объект
+    # Находим все позиции открывающих скобок
+    start_positions = []
+    for i, char in enumerate(text):
+        if char == '{':
+            start_positions.append(i)
+    
+    # Пробуем каждый кандидат, начиная с первого '{'
+    for start_pos in start_positions:
+        # Ограничиваем длину candidate
+        candidate_text = text[start_pos:start_pos + max_length]
+        
+        # Подбираем корректную закрывающую '}' с учётом вложенности и строк
+        depth = 0
+        in_string = False
+        escape_next = False
+        end_pos = -1
+        
+        for i, char in enumerate(candidate_text):
+            if escape_next:
+                escape_next = False
+                continue
+            
+            if char == '\\':
+                escape_next = True
+                continue
+            
+            if char == '"' and not escape_next:
+                in_string = not in_string
+                continue
+            
+            if not in_string:
+                if char == '{':
+                    depth += 1
+                elif char == '}':
+                    depth -= 1
+                    if depth == 0:
+                        end_pos = start_pos + i + 1
+                        break
+        
+        if end_pos > 0:
+            candidate = text[start_pos:end_pos]
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+    
+    return None
 
 
 def _validate_kazakhstan_plate(plate: str | None) -> str | None:
@@ -690,6 +769,7 @@ class EventMerger:
                 "   - Return the plate number WITHOUT spaces, dashes, or other separators (e.g., '035AER15' not '035 AER 15').\n"
                 "   - DO NOT read plates from trucks that are further away or in the background.\n"
                 "\n"
+                "CRITICAL: Return ONLY valid JSON. No markdown. No explanations. Output must start with '{' and end with '}'.\n\n"
                 "Return JSON with fields:\n"
                 "- snow_percentage: 0.0-100.0 (how full the bed is with snow, 0-100 scale)\n"
                 "- snow_confidence: 0.0-1.0 (confidence in snow analysis)\n"
@@ -718,7 +798,12 @@ class EventMerger:
             request_duration = time_module.time() - start_time
             text = (response.text or "").strip()
             print(f"[GEMINI] Response received in {request_duration:.2f}s, response_length={len(text)} chars")
-            print(f"[GEMINI] Raw response (first 500 chars): {text[:500]}")
+            
+            # Логируем первые 300 символов (без бинарных данных)
+            preview_text = text[:300] if len(text) <= 300 else text[:300] + "..."
+            # Убираем бинарные символы из лога
+            preview_text = ''.join(c if 32 <= ord(c) < 127 or c in '\n\r\t' else '.' for c in preview_text)
+            print(f"[GEMINI] Raw response preview: {preview_text}")
             
             if not text:
                 print("[GEMINI] ERROR: Empty response from Gemini")
@@ -730,22 +815,30 @@ class EventMerger:
                     "plate_confidence": 0.0,
                 }
 
-            # Очищаем ответ от markdown
+            # Используем надежное извлечение JSON
             original_text = text
-            if text.startswith("```"):
-                text = text.strip("`")
-                if text.lower().startswith("json"):
-                    text = text[4:].strip()
-                print(f"[GEMINI] Cleaned response (removed markdown): length={len(text)} chars")
-
-            try:
-                result = json.loads(text)
-                print(f"[GEMINI] Successfully parsed JSON: {result}")
+            result = _extract_json_from_text(text)
+            
+            if result is None:
+                # Не удалось извлечь JSON - логируем ошибку и возвращаем с raw
+                error_msg = "Failed to extract JSON from response"
+                print(f"[GEMINI] ERROR: {error_msg}")
+                print(f"[GEMINI] Failed response preview: {preview_text}")
+                return {
+                    "raw": original_text[:1000],  # Сохраняем первые 1000 символов
+                    "error": error_msg,
+                    "snow_percentage": 0.0,
+                    "snow_confidence": 0.0,
+                    "plate": None,
+                    "plate_confidence": 0.0,
+                }
+            
+            print(f"[GEMINI] Successfully parsed JSON: snow={result.get('snow_percentage', 0.0)}, conf={result.get('snow_confidence', 0.0)}")
                 
                 # Нормализуем результат
                 snow_percentage = result.get("snow_percentage", 0.0)
                 snow_confidence = result.get("snow_confidence", 0.0)
-                plate = result.get("plate")
+                model_plate = result.get("plate")  # Сохраняем как model_plate, не перезаписываем camera_plate
                 plate_confidence = result.get("plate_confidence", 0.0)
                 
                 # Нормализуем snow_percentage (может быть 0-1 или 0-100)
@@ -770,28 +863,29 @@ class EventMerger:
                 except (ValueError, TypeError):
                     plate_confidence = 0.0
                 
-                # Нормализуем номер (убираем пробелы, приводим к верхнему регистру)
-                if plate:
-                    plate = str(plate).strip().upper().replace(" ", "")
-                    if not plate or plate == "NULL" or plate == "NONE":
-                        plate = None
+                # Нормализуем номер от модели (убираем пробелы, приводим к верхнему регистру)
+                model_plate_normalized = None
+                if model_plate:
+                    model_plate_normalized = str(model_plate).strip().upper().replace(" ", "")
+                    if not model_plate_normalized or model_plate_normalized == "NULL" or model_plate_normalized == "NONE":
+                        model_plate_normalized = None
                 
-                # Валидируем казахстанский номер - проверяем формат и регион
-                if plate:
-                    validated_plate = _validate_kazakhstan_plate(plate)
-                    if validated_plate != plate:
-                        print(f"[GEMINI] Plate validation failed: '{plate}' -> None (invalid Kazakhstan format)")
-                        plate = None
+                # Валидируем казахстанский номер от модели - проверяем формат и регион
+                if model_plate_normalized:
+                    validated_plate = _validate_kazakhstan_plate(model_plate_normalized)
+                    if validated_plate != model_plate_normalized:
+                        print(f"[GEMINI] Model plate validation failed: '{model_plate_normalized}' -> None (invalid Kazakhstan format)")
+                        model_plate_normalized = None
                     elif validated_plate is None:
-                        print(f"[GEMINI] Plate validation failed: '{plate}' -> None (invalid format)")
-                        plate = None
+                        print(f"[GEMINI] Model plate validation failed: '{model_plate_normalized}' -> None (invalid format)")
+                        model_plate_normalized = None
                     else:
-                        print(f"[GEMINI] Plate validation passed: '{plate}'")
+                        print(f"[GEMINI] Model plate validation passed: '{model_plate_normalized}'")
                 
                 result = {
                     "snow_percentage": snow_percentage,
                     "snow_confidence": snow_confidence,
-                    "plate": plate,
+                    "model_plate": model_plate_normalized,  # Сохраняем как model_plate
                     "plate_confidence": plate_confidence,
                 }
                 
@@ -800,17 +894,6 @@ class EventMerger:
                     self._gemini_cache[photos_hash] = (result.copy(), current_time)
                 
                 return result
-            except json.JSONDecodeError as e:
-                print(f"[GEMINI] ERROR: JSON parse failed: {e}")
-                print(f"[GEMINI] Failed to parse text: {text[:500]}")
-                return {
-                    "raw": original_text,
-                    "error": f"JSON parse error: {e}",
-                    "snow_percentage": 0.0,
-                    "snow_confidence": 0.0,
-                    "plate": None,
-                    "plate_confidence": 0.0,
-                }
         except Exception as e:
             print(f"[GEMINI] EXCEPTION: {type(e).__name__}: {e}")
             import traceback
@@ -873,6 +956,7 @@ class EventMerger:
                 "sun glare, white paint, reflections, frost/ice, road, background, or closed/covered beds.\n"
                 "If the bed is not clearly visible or is closed/covered/fully outside the frame, set percentage=0 and confidence=0.0.\n"
                 "Snow must look like uneven/loose material with texture; a smooth flat surface (even if white) is NOT snow.\n"
+                "CRITICAL: Return ONLY valid JSON. No markdown. No explanations. Output must start with '{' and end with '}'.\n\n"
                 "Return JSON with fields:\n"
                 "- percentage: 0.0-1.0 or 0-100 for how full with snow\n"
                 "- confidence: 0.0-1.0\n\n"
@@ -893,27 +977,28 @@ class EventMerger:
             request_duration = time_module.time() - start_time
             text = (response.text or "").strip()
             print(f"[GEMINI] Response received in {request_duration:.2f}s, response_length={len(text)} chars")
-            print(f"[GEMINI] Raw response (first 200 chars): {text[:200]}")
+            
+            # Логируем первые 300 символов (без бинарных данных)
+            preview_text = text[:300] if len(text) <= 300 else text[:300] + "..."
+            preview_text = ''.join(c if 32 <= ord(c) < 127 or c in '\n\r\t' else '.' for c in preview_text)
+            print(f"[GEMINI] Raw response preview: {preview_text}")
             
             if not text:
                 print("[GEMINI] ERROR: Empty response from Gemini")
-                return {"error": "Empty response from Gemini"}
+                return {"error": "Empty response from Gemini", "percentage": 0.0, "confidence": 0.0}
 
+            # Используем надежное извлечение JSON
             original_text = text
-            if text.startswith("```"):
-                text = text.strip("`")
-                if text.lower().startswith("json"):
-                    text = text[4:].strip()
-                print(f"[GEMINI] Cleaned response (removed markdown): length={len(text)} chars")
-
-            try:
-                result = json.loads(text)
-                print(f"[GEMINI] Successfully parsed JSON: {result}")
-                return result
-            except json.JSONDecodeError as e:
-                print(f"[GEMINI] ERROR: JSON parse failed: {e}")
-                print(f"[GEMINI] Failed to parse text: {text[:500]}")
-                return {"raw": original_text, "error": f"JSON parse error: {e}", "percentage": 0.0, "confidence": 0.0}
+            result = _extract_json_from_text(text)
+            
+            if result is None:
+                error_msg = "Failed to extract JSON from response"
+                print(f"[GEMINI] ERROR: {error_msg}")
+                print(f"[GEMINI] Failed response preview: {preview_text}")
+                return {"raw": original_text[:1000], "error": error_msg, "percentage": 0.0, "confidence": 0.0}
+            
+            print(f"[GEMINI] Successfully parsed JSON: percentage={result.get('percentage', 0.0)}, confidence={result.get('confidence', 0.0)}")
+            return result
         except Exception as e:
             print(f"[GEMINI] EXCEPTION: {type(e).__name__}: {e}")
             import traceback
