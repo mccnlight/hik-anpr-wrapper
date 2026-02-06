@@ -98,6 +98,7 @@ def root() -> Dict[str, str]:
 async def _event_queue_worker(worker_name: str):
     """Воркер для обработки событий из очереди"""
     global _event_queue
+    print(f"[QUEUE] Worker {worker_name} started")
     while True:
         try:
             # Получаем событие из очереди (блокируем, пока не появится событие)
@@ -109,26 +110,38 @@ async def _event_queue_worker(worker_name: str):
             if task_data is None:  # Сигнал остановки
                 break
             
+            plate = task_data.get("main_plate") or task_data.get("event_data", {}).get("plate", "unknown")
+            print(f"[QUEUE] {worker_name} processing: plate={plate}")
+            
             # Обрабатываем событие
             await _process_event_background(**task_data)
             
+            print(f"[QUEUE] {worker_name} completed: plate={plate}")
+            
             # Помечаем задачу как выполненную
             _event_queue.task_done()
-        except Exception:
-            # Тихая обработка ошибок в воркере
-            pass
+        except Exception as e:
+            # Логируем ошибки для диагностики
+            print(f"[QUEUE] {worker_name} ERROR: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
 
 @app.on_event("startup")
 async def start_background_workers():
     global _event_queue, _queue_workers_started
     
+    print(f"[STARTUP] UPSTREAM_URL: {UPSTREAM_URL}")
+    print(f"[STARTUP] PLATE_CAMERA_ID: {PLATE_CAMERA_ID}")
+    
     # Создаем очередь обработки событий (уменьшено с 100 до 20 для экономии памяти)
     _event_queue = asyncio.Queue(maxsize=20)
+    print(f"[STARTUP] Event queue created (maxsize=20)")
     
     # Запускаем воркеры для обработки очереди (3 параллельных воркера)
     for i in range(3):
         asyncio.create_task(_event_queue_worker(f"worker-{i+1}"))
     _queue_workers_started = True
+    print(f"[STARTUP] 3 queue workers started")
     
     if ENABLE_SNOW_WORKER:
         from snow_worker import start_snow_worker, SNOW_VIDEO_SOURCE_URL
@@ -390,10 +403,18 @@ async def send_to_upstream(
         else:
             print(f"[UPSTREAM] ⚠️ WARNING: snow_bytes is None, not adding snowSnapshot.jpg")
 
+        print(f"[UPSTREAM] Sending to: {UPSTREAM_URL}")
+        print(f"[UPSTREAM] Event size: {len(event_str)} bytes, Files: {len(files)}")
+        
         async with httpx.AsyncClient(timeout=10.0) as client:
             # data + files => multipart/form-data
             resp = await client.post(UPSTREAM_URL, data=data, files=files or None)
-            print(f"[UPSTREAM] status={resp.status_code}, body={resp.text[:400]}")
+            print(f"[UPSTREAM] Response: status={resp.status_code}, body={resp.text[:400]}")
+
+            if resp.is_success:
+                print(f"[UPSTREAM] ✅ SUCCESS: status={resp.status_code}")
+            else:
+                print(f"[UPSTREAM] ❌ FAILED: status={resp.status_code}, error={resp.text[:400]}")
 
             return {
                 "sent": resp.is_success,
@@ -474,6 +495,11 @@ async def _process_event_background(
         
         event_data["plate"] = final_plate
         
+        # Проверяем, что plate не пустой перед отправкой
+        if not final_plate or final_plate.strip() == "":
+            print(f"[PROCESS] ⚠️ WARNING: plate is empty, using 'UNKNOWN'")
+            event_data["plate"] = "UNKNOWN"
+        
         # Процент снега и confidence от Gemini
         snow_percentage = 0.0
         snow_confidence = 0.0
@@ -492,7 +518,7 @@ async def _process_event_background(
             event_data["gemini_result"] = gemini_result
         
         # 3. Отправляем на upstream со всеми фотографиями
-        print(f"[PROCESS] Sending to upstream: snow_bytes={'present' if snow_photo_bytes else 'None'} ({len(snow_photo_bytes) if snow_photo_bytes else 0} bytes)")
+        print(f"[PROCESS] Sending to upstream: plate='{event_data.get('plate')}', snow_bytes={'present' if snow_photo_bytes else 'None'} ({len(snow_photo_bytes) if snow_photo_bytes else 0} bytes)")
         upstream_result = await send_to_upstream(
             event_data=event_data,
             detection_bytes=detection_bytes,
@@ -501,10 +527,16 @@ async def _process_event_background(
             snow_bytes=snow_photo_bytes,
         )
         
-        # Локальное логирование отключено
-    except Exception:
-        # Тихая обработка ошибок в фоне
-        pass
+        # Логируем результат отправки
+        if upstream_result.get("sent"):
+            print(f"[PROCESS] ✅ Event sent: status={upstream_result.get('status')}")
+        else:
+            print(f"[PROCESS] ❌ Event NOT sent: status={upstream_result.get('status')}, error={upstream_result.get('error', 'unknown')}")
+    except Exception as e:
+        # Логируем ошибки для диагностики
+        print(f"[PROCESS] ❌ ERROR: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         # Явно освобождаем память после обработки
         del detection_bytes, feature_bytes, license_bytes, snow_photo_bytes
