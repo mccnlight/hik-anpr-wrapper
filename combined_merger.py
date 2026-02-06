@@ -834,66 +834,66 @@ class EventMerger:
                 }
             
             print(f"[GEMINI] Successfully parsed JSON: snow={result.get('snow_percentage', 0.0)}, conf={result.get('snow_confidence', 0.0)}")
-                
-                # Нормализуем результат
-                snow_percentage = result.get("snow_percentage", 0.0)
-                snow_confidence = result.get("snow_confidence", 0.0)
-                model_plate = result.get("plate")  # Сохраняем как model_plate, не перезаписываем camera_plate
-                plate_confidence = result.get("plate_confidence", 0.0)
-                
-                # Нормализуем snow_percentage (может быть 0-1 или 0-100)
-                try:
-                    snow_percentage = float(snow_percentage)
-                    if 0.0 <= snow_percentage <= 1.0:
-                        snow_percentage = snow_percentage * 100.0
-                    snow_percentage = max(0.0, min(100.0, round(snow_percentage, 2)))
-                except (ValueError, TypeError):
-                    snow_percentage = 0.0
-                
-                # Нормализуем confidence значения
-                try:
-                    snow_confidence = float(snow_confidence)
-                    snow_confidence = max(0.0, min(1.0, snow_confidence))
-                except (ValueError, TypeError):
-                    snow_confidence = 0.0
-                
-                try:
-                    plate_confidence = float(plate_confidence)
-                    plate_confidence = max(0.0, min(1.0, plate_confidence))
-                except (ValueError, TypeError):
-                    plate_confidence = 0.0
-                
-                # Нормализуем номер от модели (убираем пробелы, приводим к верхнему регистру)
-                model_plate_normalized = None
-                if model_plate:
-                    model_plate_normalized = str(model_plate).strip().upper().replace(" ", "")
-                    if not model_plate_normalized or model_plate_normalized == "NULL" or model_plate_normalized == "NONE":
-                        model_plate_normalized = None
-                
-                # Валидируем казахстанский номер от модели - проверяем формат и регион
-                if model_plate_normalized:
-                    validated_plate = _validate_kazakhstan_plate(model_plate_normalized)
-                    if validated_plate != model_plate_normalized:
-                        print(f"[GEMINI] Model plate validation failed: '{model_plate_normalized}' -> None (invalid Kazakhstan format)")
-                        model_plate_normalized = None
-                    elif validated_plate is None:
-                        print(f"[GEMINI] Model plate validation failed: '{model_plate_normalized}' -> None (invalid format)")
-                        model_plate_normalized = None
-                    else:
-                        print(f"[GEMINI] Model plate validation passed: '{model_plate_normalized}'")
-                
-                result = {
-                    "snow_percentage": snow_percentage,
-                    "snow_confidence": snow_confidence,
-                    "model_plate": model_plate_normalized,  # Сохраняем как model_plate
-                    "plate_confidence": plate_confidence,
-                }
-                
-                # Сохраняем результат в кэш для дедупликации
-                with self._gemini_cache_lock:
-                    self._gemini_cache[photos_hash] = (result.copy(), current_time)
-                
-                return result
+            
+            # Нормализуем результат
+            snow_percentage = result.get("snow_percentage", 0.0)
+            snow_confidence = result.get("snow_confidence", 0.0)
+            model_plate = result.get("plate")  # Сохраняем как model_plate, не перезаписываем camera_plate
+            plate_confidence = result.get("plate_confidence", 0.0)
+            
+            # Нормализуем snow_percentage (может быть 0-1 или 0-100)
+            try:
+                snow_percentage = float(snow_percentage)
+                if 0.0 <= snow_percentage <= 1.0:
+                    snow_percentage = snow_percentage * 100.0
+                snow_percentage = max(0.0, min(100.0, round(snow_percentage, 2)))
+            except (ValueError, TypeError):
+                snow_percentage = 0.0
+            
+            # Нормализуем confidence значения
+            try:
+                snow_confidence = float(snow_confidence)
+                snow_confidence = max(0.0, min(1.0, snow_confidence))
+            except (ValueError, TypeError):
+                snow_confidence = 0.0
+            
+            try:
+                plate_confidence = float(plate_confidence)
+                plate_confidence = max(0.0, min(1.0, plate_confidence))
+            except (ValueError, TypeError):
+                plate_confidence = 0.0
+            
+            # Нормализуем номер от модели (убираем пробелы, приводим к верхнему регистру)
+            model_plate_normalized = None
+            if model_plate:
+                model_plate_normalized = str(model_plate).strip().upper().replace(" ", "")
+                if not model_plate_normalized or model_plate_normalized == "NULL" or model_plate_normalized == "NONE":
+                    model_plate_normalized = None
+            
+            # Валидируем казахстанский номер от модели - проверяем формат и регион
+            if model_plate_normalized:
+                validated_plate = _validate_kazakhstan_plate(model_plate_normalized)
+                if validated_plate != model_plate_normalized:
+                    print(f"[GEMINI] Model plate validation failed: '{model_plate_normalized}' -> None (invalid Kazakhstan format)")
+                    model_plate_normalized = None
+                elif validated_plate is None:
+                    print(f"[GEMINI] Model plate validation failed: '{model_plate_normalized}' -> None (invalid format)")
+                    model_plate_normalized = None
+                else:
+                    print(f"[GEMINI] Model plate validation passed: '{model_plate_normalized}'")
+            
+            result = {
+                "snow_percentage": snow_percentage,
+                "snow_confidence": snow_confidence,
+                "model_plate": model_plate_normalized,  # Сохраняем как model_plate
+                "plate_confidence": plate_confidence,
+            }
+            
+            # Сохраняем результат в кэш для дедупликации
+            with self._gemini_cache_lock:
+                self._gemini_cache[photos_hash] = (result.copy(), current_time)
+            
+            return result
         except Exception as e:
             print(f"[GEMINI] EXCEPTION: {type(e).__name__}: {e}")
             import traceback
