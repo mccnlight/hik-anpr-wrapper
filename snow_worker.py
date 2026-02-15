@@ -22,7 +22,7 @@ LINE_X1 = float(os.getenv("LINE_X1", "0.1"))
 LINE_Y1 = float(os.getenv("LINE_Y1", "0.8"))
 LINE_X2 = float(os.getenv("LINE_X2", "0.9"))
 LINE_Y2 = float(os.getenv("LINE_Y2", "0.8"))
-LINE_DIRECTION = os.getenv("LINE_DIRECTION", "any").strip().lower()  # any | forward | backward
+LINE_DIRECTION = os.getenv("LINE_DIRECTION", "r2l").strip().lower()  # только r2l (справа налево)
 
 TRUCK_CLASS_ID = int(os.getenv("SNOW_TRUCK_CLASS_ID", "7"))
 CONFIDENCE_THRESHOLD = float(os.getenv("SNOW_CONFIDENCE_THRESHOLD", "0.55"))
@@ -53,7 +53,13 @@ SHOW_WINDOW = os.getenv("SNOW_SHOW_WINDOW", "false").strip().lower() == "true"
 SQUARE_SCALE = float(os.getenv("SNOW_SQUARE_SCALE", "1.2"))  # Во сколько раз квадрат больше bbox по большей стороне
 SQUARE_MIN_SIZE = int(os.getenv("SNOW_SQUARE_MIN_SIZE", "60"))  # Минимальный размер квадрата в пикселях
 
-# Принудительно настраиваем FFMPEG backend: TCP, таймаут ~5с, небольшой буфер, тихий лог FFmpeg
+# Для Render (1 CPU): ограничиваем потоки BLAS/OMP, чтобы не держать 100% CPU
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+# OpenCV FFmpeg backend (для line_preview и прочих скриптов; снеговая камера идёт через ffmpeg_reader)
 os.environ.setdefault(
     "OPENCV_FFMPEG_CAPTURE_OPTIONS",
     "rtsp_transport;tcp|stimeout;5000000|buffer_size;1024000|loglevel;quiet",
@@ -78,8 +84,8 @@ _silence_opencv_logs()
 
 _snow_thread: threading.Thread | None = None
 _stop_event = threading.Event()
-_cap: cv2.VideoCapture | None = None
-_cap_lock = threading.Lock()
+_snow_reader = None  # FFmpegRTSPReader from ffmpeg_reader (lazy import)
+_reader_lock = threading.Lock()
 _merger = None
 
 # Буфер кадров с временными метками для доступа к прошлым кадрам
@@ -922,21 +928,41 @@ def _encode_frame_to_jpeg(frame: np.ndarray) -> Tuple[bytes, datetime]:
 
 # === Основной цикл снежной камеры (упрощенный - только чтение потока) ===
 
+def _open_snow_reader():
+    """Открыть снеговой поток через FFmpeg (как в rtsp-yakor). Возвращает reader или None."""
+    from ffmpeg_reader import (
+        FFmpegRTSPReader,
+        SNOW_FFMPEG_OUT_W,
+        SNOW_FFMPEG_OUT_H,
+        SNOW_FFMPEG_INPUT_FPS,
+    )
+    reader = FFmpegRTSPReader(
+        SNOW_VIDEO_SOURCE_URL,
+        name="snow",
+        width=SNOW_FFMPEG_OUT_W,
+        height=SNOW_FFMPEG_OUT_H,
+        fps=SNOW_FFMPEG_INPUT_FPS,
+    )
+    if reader.start():
+        return reader
+    return None
+
+
 def _snow_loop():
     """
-    Упрощенный цикл: читает RTSP поток и сохраняет кадры в буфер с временными метками.
-    Автоматические события больше не создаются - фото делается по запросу через capture_snow_photo().
-    Кадры сохраняются в буфер, чтобы можно было получить кадр из прошлого (когда машина была под снеговой камерой).
+    Читает RTSP снеговой камеры через FFmpeg subprocess (как в rtsp-yakor):
+    устойчивость к битому H.264, discardcorrupt, низкая задержка, подходит для Render (1 CPU).
+    Кадры сохраняются в буфер для capture_snow_photo().
     """
-    global _cap, _frame_buffer
+    global _snow_reader, _frame_buffer
     last_side = None
     last_trigger_ts = 0.0
     last_bbox: Optional[Tuple[int, int, int, int]] = None
     line_norm = (LINE_X1, LINE_Y1, LINE_X2, LINE_Y2)
-    
-    _cap = cv2.VideoCapture(SNOW_VIDEO_SOURCE_URL, cv2.CAP_FFMPEG)
-    if not _cap.isOpened():
-        print(f"[SNOW] cannot open video source: {SNOW_VIDEO_SOURCE_URL}")
+
+    _snow_reader = _open_snow_reader()
+    if _snow_reader is None:
+        print(f"[SNOW] cannot open video source (ffmpeg required): {SNOW_VIDEO_SOURCE_URL[:50]}...")
         return
 
     window_name = "Snow Camera" if SHOW_WINDOW else None
@@ -946,24 +972,26 @@ def _snow_loop():
 
     fail_count = 0
     MAX_FAILS = 15
-    last_log_time = 0.0
-    LOG_INTERVAL_SECONDS = 8.0  # Логируем раз в 8 секунд
     frame_counter = 0
 
-    print(f"[SNOW] worker started (buffering mode - storing frames for {BUFFER_DURATION_SECONDS}s)")
-    
+    print(f"[SNOW] worker started (FFmpeg reader, buffering {BUFFER_DURATION_SECONDS}s)")
+
     while not _stop_event.is_set():
-        with _cap_lock:
-            ret, frame = _cap.read()
-        
+        ret, frame = _snow_reader.read(timeout_s=1.0, stale_s=3.0)
+
         if not ret or frame is None or frame.size == 0:
             fail_count += 1
             if fail_count >= MAX_FAILS:
-                with _cap_lock:
-                    _cap.release()
-                    time.sleep(2)
-                    _cap = cv2.VideoCapture(SNOW_VIDEO_SOURCE_URL, cv2.CAP_FFMPEG)
+                with _reader_lock:
+                    if _snow_reader is not None:
+                        _snow_reader.release()
+                        _snow_reader = None
+                time.sleep(2)
+                _snow_reader = _open_snow_reader()
                 fail_count = 0
+                if _snow_reader is None:
+                    time.sleep(5)
+                    continue
             time.sleep(0.05)
             continue
 
@@ -1070,33 +1098,28 @@ def _snow_loop():
                 _stop_event.set()
                 break
 
-        # Проверяем пересечение линии для лучшей машины (как и раньше)
+        # Пересечение линии: по началу пересечения (передняя грань bbox), только справа → налево (R→L)
         try:
             if bbox:
                 x1, y1, x2, y2 = bbox
-                cx = (x1 + x2) // 2
-                cy = (y1 + y2) // 2
+                # При движении справа налево «нос» грузовика — левая грань bbox; считаем по её центру
+                lead_x = x1
+                lead_y = (y1 + y2) // 2
 
-                # Вычисляем сторону относительно линии
                 lx1, ly1, lx2, ly2 = line_norm
                 ax = lx1 * w
                 ay = ly1 * h
                 bx = lx2 * w
                 by = ly2 * h
-                cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+                cross = (bx - ax) * (lead_y - ay) - (by - ay) * (lead_x - ax)
                 side = 1 if cross > 0 else -1
 
-                # Направление: forward = слева->справа относительно A->B, backward наоборот
+                # Только R→L: считаем пересечение только когда передняя точка перешла с правой стороны линии на левую (last_side > 0 → side < 0)
                 allowed = False
                 if last_side is None:
                     last_side = side
-                elif side != last_side:
-                    if LINE_DIRECTION == "any":
-                        allowed = True
-                    elif LINE_DIRECTION == "forward" and last_side > 0 and side < 0:
-                        allowed = True
-                    elif LINE_DIRECTION == "backward" and last_side < 0 and side > 0:
-                        allowed = True
+                elif side != last_side and last_side > 0 and side < 0:
+                    allowed = True
 
                 if allowed and (time.time() - last_trigger_ts) > 1.0:
                     last_trigger_ts = time.time()
@@ -1131,10 +1154,10 @@ def _snow_loop():
         time.sleep(0.01)
         frame_counter += 1
 
-    with _cap_lock:
-        if _cap is not None:
-            _cap.release()
-            _cap = None
+    with _reader_lock:
+        if _snow_reader is not None:
+            _snow_reader.release()
+            _snow_reader = None
     if SHOW_WINDOW:
         cv2.destroyAllWindows()
     print("[SNOW] worker stopped")

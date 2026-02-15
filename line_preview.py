@@ -306,10 +306,15 @@ def main() -> int:
         print("[LINE-PREVIEW] ERROR: SNOW_VIDEO_SOURCE_URL not set in app.env/system env")
         return 1
 
-    cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
+    # TCP-транспорт для RTSP уменьшает потери и ошибки декодера H.264 при плохой сети
+    url = RTSP_URL
+    if url.lower().startswith("rtsp://") and "rtsp_transport=" not in url:
+        url = url + ("&" if "?" in url else "?") + "rtsp_transport=tcp"
+    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
     if not cap.isOpened():
         print(f"[LINE-PREVIEW] ERROR: cannot open RTSP: {RTSP_URL}")
         return 1
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # меньше буфер — меньше задержка и «залипание» на битых кадрах
 
     state = LineState(LINE_X1, LINE_Y1, LINE_X2, LINE_Y2)
     state.clamp()

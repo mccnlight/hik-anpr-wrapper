@@ -11,3 +11,4 @@
 /.venv311/
 /snapshots/
 *.env
+app.env
