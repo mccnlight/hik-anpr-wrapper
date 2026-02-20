@@ -11,7 +11,7 @@ import httpx
 import cv2
 import numpy as np
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from combined_merger import init_merger
 from limitations.plate_rules import normalize_primary_plate
@@ -90,9 +90,21 @@ def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
+@app.head("/health")
+def health_head():
+    """HEAD /health для проверок со стороны Render/LB без 405."""
+    return Response(status_code=200)
+
+
 @app.get("/", summary="Root")
 def root() -> Dict[str, str]:
     return {"status": "ok"}
+
+
+@app.head("/")
+def root_head():
+    """HEAD / для проверок со стороны Render/LB без 405."""
+    return Response(status_code=200)
 
 
 async def _event_queue_worker(worker_name: str):
@@ -150,6 +162,18 @@ async def start_background_workers():
         start_snow_worker(merger)
     else:
         print("[STARTUP] snow worker disabled (set ENABLE_SNOW_WORKER=true to enable)")
+
+
+@app.on_event("shutdown")
+async def shutdown_workers():
+    """Корректная остановка снегового воркера и FFmpeg при выключении сервиса."""
+    if ENABLE_SNOW_WORKER:
+        try:
+            from snow_worker import stop_snow_worker
+            stop_snow_worker()
+            print("[SHUTDOWN] snow worker stopped")
+        except Exception as e:
+            print(f"[SHUTDOWN] error stopping snow worker: {e}")
 
 
 @app.post("/anpr", summary="Recognize Plate")
@@ -350,20 +374,8 @@ async def send_to_upstream(
         print("[UPSTREAM] EVENT JSON:")
         print(event_str)
 
-        # photos — список файлов под одним и тем же ключом "photos"
+        # photos — в upstream отправляем только featurePicture и snowSnapshot
         files = []
-
-        if detection_bytes:
-            print(
-                f"[UPSTREAM] add photo: field='photos', name='detectionPicture.jpg', "
-                f"size={len(detection_bytes)}"
-            )
-            files.append(
-                (
-                    "photos",
-                    ("detectionPicture.jpg", detection_bytes, "image/jpeg"),
-                )
-            )
 
         if feature_bytes:
             print(
@@ -374,18 +386,6 @@ async def send_to_upstream(
                 (
                     "photos",
                     ("featurePicture.jpg", feature_bytes, "image/jpeg"),
-                )
-            )
-
-        if license_bytes:
-            print(
-                f"[UPSTREAM] add photo: field='photos', name='licensePlatePicture.jpg', "
-                f"size={len(license_bytes)}"
-            )
-            files.append(
-                (
-                    "photos",
-                    ("licensePlatePicture.jpg", license_bytes, "image/jpeg"),
                 )
             )
 
