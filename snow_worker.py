@@ -4,7 +4,7 @@ import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple, Dict
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import concurrent.futures
 import hashlib
 
@@ -15,27 +15,14 @@ import numpy as np
 
 SNOW_VIDEO_SOURCE_URL = os.getenv("SNOW_VIDEO_SOURCE_URL", "")
 SNOW_CAMERA_ID = os.getenv("SNOW_CAMERA_ID", "camera-snow")
-SNOW_CAPTURE_AFTER_LINE_SECONDS = float(os.getenv("SNOW_CAPTURE_AFTER_LINE_SECONDS", "0.5"))
-SNOW_LINE_TRIGGER_COOLDOWN_SECONDS = float(os.getenv("SNOW_LINE_TRIGGER_COOLDOWN_SECONDS", "1.0"))
+SNOW_CAPTURE_DELAY_SECONDS = float(os.getenv("SNOW_CAPTURE_DELAY_SECONDS", "1.0"))  # Задержка перед захватом фото
 
 # Линия пересечения (нормированные координаты 0..1)
 LINE_X1 = float(os.getenv("LINE_X1", "0.1"))
 LINE_Y1 = float(os.getenv("LINE_Y1", "0.8"))
 LINE_X2 = float(os.getenv("LINE_X2", "0.9"))
 LINE_Y2 = float(os.getenv("LINE_Y2", "0.8"))
-_LINE_DIRECTION_RAW = os.getenv("LINE_DIRECTION", "r2l").strip().lower()
-LINE_DIRECTION = {
-    "r2l": "r2l",
-    "rtl": "r2l",
-    "right_to_left": "r2l",
-    "backward": "r2l",
-    "l2r": "l2r",
-    "ltr": "l2r",
-    "left_to_right": "l2r",
-    "forward": "l2r",
-    "any": "any",
-    "both": "any",
-}.get(_LINE_DIRECTION_RAW, "r2l")
+LINE_DIRECTION = os.getenv("LINE_DIRECTION", "r2l").strip().lower()  # только r2l (справа налево)
 
 TRUCK_CLASS_ID = int(os.getenv("SNOW_TRUCK_CLASS_ID", "7"))
 CONFIDENCE_THRESHOLD = float(os.getenv("SNOW_CONFIDENCE_THRESHOLD", "0.55"))
@@ -107,28 +94,9 @@ class TimestampedFrame:
     frame: np.ndarray
     timestamp: float  # time.time()
 
-
-@dataclass
-class LineCrossTrack:
-    bbox: Tuple[int, int, int, int]
-    center_x: float
-    center_y: float
-    size_ratio: float
-    side: int
-    lead_x: float
-    lead_y: float
-    last_seen_ts: float
-    seen_frames: int = 1
-    missing_frames: int = 0
-    motion_deltas_x: deque[float] = field(default_factory=lambda: deque(maxlen=4))
-
-BUFFER_DURATION_SECONDS = float(os.getenv("SNOW_BUFFER_DURATION_SECONDS", "15.0"))
-FRAME_BUFFER_MAXLEN = max(
-    90,
-    int(BUFFER_DURATION_SECONDS * max(float(os.getenv("SNOW_FFMPEG_INPUT_FPS", "6.0")), 1.0) * 2),
-)
-_frame_buffer = deque(maxlen=FRAME_BUFFER_MAXLEN)
+_frame_buffer: deque[TimestampedFrame] = deque(maxlen=90)  # ~3 секунды при 30 FPS (уменьшено с 300 для экономии памяти)
 _frame_buffer_lock = threading.Lock()
+BUFFER_DURATION_SECONDS = 3.0  # Храним кадры за последние 3 секунды (уменьшено с 10.0 для экономии памяти)
 
 # YOLO модель для детекции грузовиков
 _yolo_model = None
@@ -138,8 +106,6 @@ _yolo_model_lock = threading.Lock()
 _detection_cache: Dict[float, Tuple[float, Optional[Tuple[int, int, int, int]]]] = {}
 _detection_cache_lock = threading.Lock()
 DETECTION_CACHE_TTL = 30.0  # Кэш живет 30 секунд
-TRACK_MIN_STABLE_FRAMES = 3
-TRACK_MAX_MISSING_FRAMES = max(1, MISS_RESET_THRESHOLD_ENV)
 
 
 def _make_dynamic_square(
@@ -453,136 +419,6 @@ def _process_frame_for_delay(target_delay: float, current_time: float, model) ->
     if quality_score > 0:
         return (quality_score, best_frame, bbox, vehicles_count, all_vehicles)
     return None
-
-
-def _line_direction_allows_crossing(last_side: int, side: int) -> bool:
-    if side == last_side:
-        return False
-    if LINE_DIRECTION == "any":
-        return True
-    if LINE_DIRECTION == "l2r":
-        return last_side < 0 and side > 0
-    return last_side > 0 and side < 0
-
-
-def _get_line_probe_point(bbox: Tuple[int, int, int, int]) -> Tuple[float, float]:
-    x1, y1, x2, y2 = bbox
-    if LINE_DIRECTION == "l2r":
-        probe_x = float(x2)
-    elif LINE_DIRECTION == "r2l":
-        probe_x = float(x1)
-    else:
-        probe_x = (x1 + x2) / 2.0
-    probe_y = (y1 + y2) / 2.0
-    return probe_x, probe_y
-
-
-def _point_side_of_line(
-    point_x: float,
-    point_y: float,
-    frame_width: int,
-    frame_height: int,
-    line_norm: Tuple[float, float, float, float],
-) -> int:
-    lx1, ly1, lx2, ly2 = line_norm
-    ax = lx1 * frame_width
-    ay = ly1 * frame_height
-    bx = lx2 * frame_width
-    by = ly2 * frame_height
-    cross = (bx - ax) * (point_y - ay) - (by - ay) * (point_x - ax)
-    return 1 if cross > 0 else -1
-
-
-def _bbox_iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
-    ax1, ay1, ax2, ay2 = a
-    bx1, by1, bx2, by2 = b
-
-    inter_x1 = max(ax1, bx1)
-    inter_y1 = max(ay1, by1)
-    inter_x2 = min(ax2, bx2)
-    inter_y2 = min(ay2, by2)
-    inter_w = max(0, inter_x2 - inter_x1)
-    inter_h = max(0, inter_y2 - inter_y1)
-    inter_area = inter_w * inter_h
-    if inter_area <= 0:
-        return 0.0
-
-    area_a = max(1, (ax2 - ax1) * (ay2 - ay1))
-    area_b = max(1, (bx2 - bx1) * (by2 - by1))
-    union_area = area_a + area_b - inter_area
-    if union_area <= 0:
-        return 0.0
-    return inter_area / union_area
-
-
-def _find_matching_track(
-    tracks: Dict[int, LineCrossTrack],
-    vehicle: dict,
-    matched_track_ids: set[int],
-) -> Optional[int]:
-    best_track_id = None
-    best_score = float("-inf")
-
-    bbox = vehicle["bbox"]
-    center_x = float(vehicle["center_x"])
-    center_y = float(vehicle["center_y"])
-    size_ratio = float(vehicle["size_ratio"])
-    vx1, vy1, vx2, vy2 = bbox
-    vehicle_diag = ((vx2 - vx1) ** 2 + (vy2 - vy1) ** 2) ** 0.5
-
-    for track_id, track in tracks.items():
-        if track_id in matched_track_ids:
-            continue
-
-        tx1, ty1, tx2, ty2 = track.bbox
-        track_diag = ((tx2 - tx1) ** 2 + (ty2 - ty1) ** 2) ** 0.5
-        max_distance = max(90.0, max(track_diag, vehicle_diag) * 0.8)
-        center_distance = ((center_x - track.center_x) ** 2 + (center_y - track.center_y) ** 2) ** 0.5
-        iou = _bbox_iou(track.bbox, bbox)
-        size_diff = abs(size_ratio - track.size_ratio)
-
-        if center_distance > max_distance and iou < 0.05:
-            continue
-        if size_diff > 0.05 and iou < 0.05:
-            continue
-
-        score = iou * 3.0 - (center_distance / max_distance) - size_diff * 5.0
-        if score > best_score:
-            best_score = score
-            best_track_id = track_id
-
-    if best_score <= -0.25:
-        return None
-    return best_track_id
-
-
-def _track_motion_matches_direction(motion_deltas_x: deque[float]) -> bool:
-    if len(motion_deltas_x) < 2:
-        return False
-
-    total_dx = sum(motion_deltas_x)
-    min_total_dx = max(float(MIN_DIRECTION_DELTA) * 2.0, 8.0)
-    if LINE_DIRECTION == "any":
-        return abs(total_dx) >= min_total_dx
-    if LINE_DIRECTION == "l2r":
-        return total_dx >= min_total_dx
-    return total_dx <= -min_total_dx
-
-
-def _get_buffered_frame_at(target_timestamp: float) -> Optional[TimestampedFrame]:
-    with _frame_buffer_lock:
-        if len(_frame_buffer) == 0:
-            return None
-
-        best_frame = None
-        best_delta = float("inf")
-        for timestamped_frame in _frame_buffer:
-            delta = abs(timestamped_frame.timestamp - target_timestamp)
-            if delta < best_delta:
-                best_delta = delta
-                best_frame = timestamped_frame
-
-        return best_frame
 
 def _check_vehicle_movement(vehicles_by_frame: list) -> Dict[int, bool]:
     """
@@ -1119,12 +955,9 @@ def _snow_loop():
     Кадры сохраняются в буфер для capture_snow_photo().
     """
     global _snow_reader, _frame_buffer
-    line_tracks: Dict[int, LineCrossTrack] = {}
-    next_track_id = 1
+    last_side = None
     last_trigger_ts = 0.0
-    pending_capture_target_ts: float | None = None
-    pending_capture_bbox: Optional[Tuple[int, int, int, int]] = None
-    pending_capture_track_id: Optional[int] = None
+    last_bbox: Optional[Tuple[int, int, int, int]] = None
     line_norm = (LINE_X1, LINE_Y1, LINE_X2, LINE_Y2)
 
     _snow_reader = _open_snow_reader()
@@ -1196,11 +1029,15 @@ def _snow_loop():
         vehicles_count = 0
         all_veh = []
         model = None
-        h, w = frame.shape[:2]
         try:
+            h, w = frame.shape[:2]
             model = _get_yolo_model()
             if model is not None:
                 quality_score, bbox, vehicles_count, all_veh = _assess_frame_quality(frame, time.time(), model)
+            if quality_score <= 0 or not bbox:
+                last_bbox = None
+            else:
+                last_bbox = bbox
         except Exception:
             # В случае любой ошибки детекции — просто показываем кадр без рамок
             quality_score = 0.0
@@ -1261,173 +1098,57 @@ def _snow_loop():
                 _stop_event.set()
                 break
 
-        # Пересечение линии: ведем состояние по конкретной машине, а не по одному bbox на весь поток.
+        # Пересечение линии: по началу пересечения (передняя грань bbox), только справа → налево (R→L)
         try:
-            matched_track_ids = set()
-            crossed_tracks: list[Tuple[int, LineCrossTrack]] = []
-            candidate_vehicles = []
+            if bbox:
+                x1, y1, x2, y2 = bbox
+                # При движении справа налево «нос» грузовика — левая грань bbox; считаем по её центру
+                lead_x = x1
+                lead_y = (y1 + y2) // 2
 
-            for vehicle in all_veh:
-                vehicle_bbox = vehicle.get("bbox")
-                if not vehicle_bbox:
-                    continue
+                lx1, ly1, lx2, ly2 = line_norm
+                ax = lx1 * w
+                ay = ly1 * h
+                bx = lx2 * w
+                by = ly2 * h
+                cross = (bx - ax) * (lead_y - ay) - (by - ay) * (lead_x - ax)
+                side = 1 if cross > 0 else -1
 
-                in_zone, _, _, _, _, _, _ = _check_center_zone(vehicle_bbox, w, h)
-                if not in_zone:
-                    continue
+                # Только R→L: считаем пересечение только когда передняя точка перешла с правой стороны линии на левую (last_side > 0 → side < 0)
+                allowed = False
+                if last_side is None:
+                    last_side = side
+                elif side != last_side and last_side > 0 and side < 0:
+                    allowed = True
 
-                lead_x, lead_y = _get_line_probe_point(vehicle_bbox)
-                side = _point_side_of_line(lead_x, lead_y, w, h, line_norm)
-                vehicle_data = dict(vehicle)
-                vehicle_data["lead_x"] = lead_x
-                vehicle_data["lead_y"] = lead_y
-                vehicle_data["side"] = side
-                candidate_vehicles.append(vehicle_data)
-
-            for vehicle in sorted(candidate_vehicles, key=lambda item: item["size_ratio"], reverse=True):
-                track_id = _find_matching_track(line_tracks, vehicle, matched_track_ids)
-                if track_id is None:
-                    track_id = next_track_id
-                    next_track_id += 1
-                    line_tracks[track_id] = LineCrossTrack(
-                        bbox=vehicle["bbox"],
-                        center_x=float(vehicle["center_x"]),
-                        center_y=float(vehicle["center_y"]),
-                        size_ratio=float(vehicle["size_ratio"]),
-                        side=int(vehicle["side"]),
-                        lead_x=float(vehicle["lead_x"]),
-                        lead_y=float(vehicle["lead_y"]),
-                        last_seen_ts=current_timestamp,
-                    )
-                    matched_track_ids.add(track_id)
-                    continue
-
-                track = line_tracks[track_id]
-                prev_side = track.side
-                delta_x = float(vehicle["center_x"]) - track.center_x
-                if abs(delta_x) >= 1.0:
-                    track.motion_deltas_x.append(delta_x)
-
-                track.bbox = vehicle["bbox"]
-                track.center_x = float(vehicle["center_x"])
-                track.center_y = float(vehicle["center_y"])
-                track.size_ratio = float(vehicle["size_ratio"])
-                track.side = int(vehicle["side"])
-                track.lead_x = float(vehicle["lead_x"])
-                track.lead_y = float(vehicle["lead_y"])
-                track.last_seen_ts = current_timestamp
-                track.seen_frames += 1
-                track.missing_frames = 0
-                matched_track_ids.add(track_id)
-
-                if (
-                    track.seen_frames >= TRACK_MIN_STABLE_FRAMES
-                    and _line_direction_allows_crossing(prev_side, track.side)
-                    and _track_motion_matches_direction(track.motion_deltas_x)
-                ):
-                    crossed_tracks.append((track_id, track))
-
-            stale_track_ids = []
-            for track_id, track in line_tracks.items():
-                if track_id in matched_track_ids:
-                    continue
-                track.missing_frames += 1
-                if track.missing_frames > TRACK_MAX_MISSING_FRAMES:
-                    stale_track_ids.append(track_id)
-
-            for track_id in stale_track_ids:
-                del line_tracks[track_id]
-
-            if (
-                crossed_tracks
-                and pending_capture_target_ts is None
-                and (current_timestamp - last_trigger_ts) > SNOW_LINE_TRIGGER_COOLDOWN_SECONDS
-            ):
-                track_id, selected_track = max(crossed_tracks, key=lambda item: item[1].size_ratio)
-                last_trigger_ts = current_timestamp
-                pending_capture_target_ts = current_timestamp + SNOW_CAPTURE_AFTER_LINE_SECONDS
-                pending_capture_bbox = selected_track.bbox
-                pending_capture_track_id = track_id
-                print(
-                    f"[SNOW] line crossed by track={track_id}, scheduled capture in "
-                    f"{SNOW_CAPTURE_AFTER_LINE_SECONDS:.2f}s "
-                    f"(direction={LINE_DIRECTION}, total_dx={sum(selected_track.motion_deltas_x):.1f})"
-                )
-        except Exception as e:
-            print(f"[SNOW] line tracking error: {e}")
-
-        if pending_capture_target_ts is not None and current_timestamp >= pending_capture_target_ts:
-            try:
-                capture_frame = _get_buffered_frame_at(pending_capture_target_ts) or timestamped_frame
-                capture_bbox = pending_capture_bbox
-
-                if model is not None:
+                if allowed and (time.time() - last_trigger_ts) > 1.0:
+                    last_trigger_ts = time.time()
+                    last_side = side
                     try:
-                        capture_score, detected_bbox, _, capture_vehicles = _assess_frame_quality(
-                            capture_frame.frame,
-                            capture_frame.timestamp,
-                            model,
-                        )
-                        if capture_bbox and capture_vehicles:
-                            best_vehicle_bbox = None
-                            best_vehicle_score = float("-inf")
-                            px1, py1, px2, py2 = capture_bbox
-                            pending_cx = (px1 + px2) / 2.0
-                            pending_cy = (py1 + py2) / 2.0
-                            for vehicle in capture_vehicles:
-                                vehicle_bbox = vehicle.get("bbox")
-                                if not vehicle_bbox:
-                                    continue
-                                in_zone, _, _, _, _, _, _ = _check_center_zone(vehicle_bbox, w, h)
-                                if not in_zone:
-                                    continue
-
-                                vx1, vy1, vx2, vy2 = vehicle_bbox
-                                vehicle_cx = (vx1 + vx2) / 2.0
-                                vehicle_cy = (vy1 + vy2) / 2.0
-                                center_distance = ((vehicle_cx - pending_cx) ** 2 + (vehicle_cy - pending_cy) ** 2) ** 0.5
-                                max_distance = max(80.0, max(px2 - px1, vx2 - vx1) * 1.2)
-                                iou = _bbox_iou(capture_bbox, vehicle_bbox)
-                                score = iou * 3.0 - (center_distance / max_distance)
-                                if score > best_vehicle_score:
-                                    best_vehicle_score = score
-                                    best_vehicle_bbox = vehicle_bbox
-
-                            if best_vehicle_bbox is not None and best_vehicle_score > 0.0:
-                                capture_bbox = best_vehicle_bbox
-                        elif capture_score > 0 and detected_bbox:
-                            capture_bbox = detected_bbox
-                    except Exception:
-                        pass
-
-                ok, buf = cv2.imencode(".jpg", capture_frame.frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
-                if ok:
-                    photo_bytes = buf.tobytes()
-                    payload = {
-                        "event_time": datetime.fromtimestamp(capture_frame.timestamp, timezone.utc).isoformat().replace("+00:00", "Z"),
-                        "camera_id": SNOW_CAMERA_ID,
-                        "bbox": capture_bbox,
-                        "line": {
-                            "x1": LINE_X1,
-                            "y1": LINE_Y1,
-                            "x2": LINE_X2,
-                            "y2": LINE_Y2,
-                            "direction": LINE_DIRECTION,
-                        },
-                    }
-                    if _merger:
-                        _merger.add_snow_event(payload, photo_bytes)
-                        print(
-                            f"[SNOW] snow event pushed to merger, bytes={len(photo_bytes)}, "
-                            f"capture_delay={SNOW_CAPTURE_AFTER_LINE_SECONDS:.2f}s, "
-                            f"track={pending_capture_track_id}"
-                        )
-            except Exception as e:
-                print(f"[SNOW] error on delayed line crossing capture: {e}")
-            finally:
-                pending_capture_target_ts = None
-                pending_capture_bbox = None
-                pending_capture_track_id = None
+                        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                        if ok:
+                            photo_bytes = buf.tobytes()
+                            payload = {
+                                "event_time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                                "camera_id": SNOW_CAMERA_ID,
+                                "bbox": bbox,
+                                "line": {
+                                    "x1": LINE_X1,
+                                    "y1": LINE_Y1,
+                                    "x2": LINE_X2,
+                                    "y2": LINE_Y2,
+                                    "direction": LINE_DIRECTION,
+                                },
+                            }
+                            if _merger:
+                                _merger.add_snow_event(payload, photo_bytes)
+                                print(f"[SNOW] line crossed, snow event pushed to merger, bytes={len(photo_bytes)}")
+                    except Exception as e:
+                        print(f"[SNOW] error on line crossing capture: {e}")
+                else:
+                    last_side = side
+        except Exception:
+            pass
 
         # Небольшая пауза, чтобы не грузить CPU
         time.sleep(0.01)

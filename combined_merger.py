@@ -275,16 +275,12 @@ class EventMerger:
         self._gemini_cache_ttl = 300.0  # Кэш живет 5 минут
         # key: (plate, event_time_iso) -> stored_time
         self._processed_anpr: Dict[Tuple[str, str], datetime] = {}
-        self._inflight_anpr: Dict[Tuple[str, str], datetime] = {}
         # Опциональная проверка whitelist перед Gemini
         self._vehicle_check_url = os.getenv(
             "MERGER_VEHICLE_CHECK_URL",
             "https://snowops-anpr-service.onrender.com/internal/vehicles/check",
         )
         self._vehicle_check_token = os.getenv("MERGER_VEHICLE_CHECK_TOKEN", "")
-        self._require_whitelist_for_gemini = (
-            os.getenv("MERGER_REQUIRE_WHITELIST_FOR_GEMINI", "false").strip().lower() == "true"
-        )
         self._stop_cleanup = threading.Event()
         self._cleanup_thread = threading.Thread(
             target=self._cleanup_loop, daemon=True, name="merger-cleanup"
@@ -330,14 +326,6 @@ class EventMerger:
         if removed_processed > 0:
             print(f"[MERGER] cleaned up {removed_processed} processed ANPR marks (age > TTL)")
 
-        removed_inflight = 0
-        for key, ts in list(self._inflight_anpr.items()):
-            if (now - ts).total_seconds() > ttl_seconds:
-                del self._inflight_anpr[key]
-                removed_inflight += 1
-        if removed_inflight > 0:
-            print(f"[MERGER] cleaned up {removed_inflight} inflight ANPR marks (age > TTL)")
-
     def add_snow_event(self, payload: Dict[str, Any], photo_bytes: bytes | None) -> None:
         event_time_str = str(payload.get("event_time", ""))
         event_time = _parse_iso_dt(event_time_str) or _now()
@@ -362,11 +350,6 @@ class EventMerger:
             anpr_match = self._pop_anpr_match(event_time)
             if anpr_match:
                 print(f"[MERGER] found ANPR match for snow event (ANPR came first), will process in background thread")
-                self._mark_inflight(
-                    str(anpr_match.event_data.get("plate") or ""),
-                    str(anpr_match.event_data.get("event_time") or ""),
-                    now,
-                )
                 # Запускаем обработку в отдельном потоке
                 def process_in_thread():
                     import asyncio
@@ -394,30 +377,6 @@ class EventMerger:
 
     def _mark_processed(self, plate: str, event_time_iso: str, ts: datetime) -> None:
         self._processed_anpr[(plate, event_time_iso)] = ts
-
-    @staticmethod
-    def _make_anpr_key(plate: str, event_time_iso: str) -> Tuple[str, str]:
-        return (str(plate or "").strip() or "UNKNOWN", str(event_time_iso or "").strip())
-
-    def _mark_inflight(self, plate: str, event_time_iso: str, ts: datetime) -> None:
-        self._inflight_anpr[self._make_anpr_key(plate, event_time_iso)] = ts
-
-    def _clear_inflight(self, plate: str, event_time_iso: str) -> None:
-        self._inflight_anpr.pop(self._make_anpr_key(plate, event_time_iso), None)
-
-    def _is_inflight(self, plate: str, event_time_iso: str) -> bool:
-        return self._make_anpr_key(plate, event_time_iso) in self._inflight_anpr
-
-    def _remove_queued_anpr_event(self, anpr_time: datetime, anpr_event: Dict[str, Any]) -> bool:
-        for idx, anpr_evt in enumerate(self._anpr_events):
-            if (
-                abs((anpr_evt.event_time - anpr_time).total_seconds()) < 1.0
-                and anpr_evt.event_data.get("plate") == anpr_event.get("plate")
-            ):
-                del self._anpr_events[idx]
-                print("[MERGER] removed matched ANPR event from queue")
-                return True
-        return False
 
     def _pop_anpr_match(self, snow_time: datetime) -> Optional[ANPREvent]:
         """
@@ -1094,8 +1053,6 @@ class EventMerger:
         """
         Обрабатывает совпавшую пару ANPR и снег (когда снег пришел раньше ANPR).
         """
-        plate = str(anpr_event_obj.event_data.get("plate") or "")
-        event_time_iso = str(anpr_event_obj.event_data.get("event_time") or "")
         try:
             result = await self._combine_and_send_internal(
                 anpr_event_obj.event_data,
@@ -1111,9 +1068,6 @@ class EventMerger:
             import traceback
             print(f"[MERGER] Traceback: {traceback.format_exc()}")
             return {"sent": False, "error": str(e)}
-        finally:
-            with self._lock:
-                self._clear_inflight(plate, event_time_iso)
 
     async def combine_and_send(
         self,
@@ -1167,22 +1121,6 @@ class EventMerger:
                     # ВАЖНО: очистка должна использовать текущее время, а не anpr_time
                     current_time = _now()
                     self._cleanup(current_time)
-                    if self._is_processed(plate, anpr_time_str):
-                        print("[MERGER] ANPR already sent by snow-matched path while waiting")
-                        return {
-                            "sent": True,
-                            "status": None,
-                            "error": None,
-                            "matched_snow": True,
-                        }
-                    if self._is_inflight(plate, anpr_time_str):
-                        print("[MERGER] ANPR already claimed by snow-matched path while waiting")
-                        return {
-                            "sent": False,
-                            "status": None,
-                            "error": "processing_by_snow_match",
-                            "matched_snow": True,
-                        }
                     queue_size_before = len(self._snow_events)
                     snow_event = self._pop_match(anpr_time)
                     queue_size_after = len(self._snow_events)
@@ -1190,28 +1128,23 @@ class EventMerger:
                     print(f"[MERGER] found late snow match while waiting (after {check_count * 0.2:.1f}s, {check_count} checks)")
                     # Удаляем ANPR событие из очереди, так как оно будет обработано
                     with self._lock:
-                        self._remove_queued_anpr_event(anpr_time, anpr_event)
+                        # Находим и удаляем соответствующее ANPR событие (то, которое было добавлено в очередь)
+                        # Ищем по времени и данным события
+                        for idx, anpr_evt in enumerate(self._anpr_events):
+                            # Сравниваем время и номер для точного совпадения
+                            if (abs((anpr_evt.event_time - anpr_time).total_seconds()) < 1.0 and
+                                anpr_evt.event_data.get("plate") == anpr_event.get("plate")):
+                                del self._anpr_events[idx]
+                                print(f"[MERGER] removed matched ANPR event from queue")
+                                break
                     break
                 # Логируем каждые 5 проверок (раз в секунду), чтобы не спамить
                 if check_count % 5 == 0:
                     elapsed = check_count * 0.2
                     remaining = wait_duration - elapsed
                     print(f"[MERGER] still waiting for snow match (elapsed={elapsed:.1f}s, remaining={remaining:.1f}s, queue_size={queue_size_before})")
-
-        if snow_event is None:
-            if REQUIRE_SNOW_MATCH:
-                print("[MERGER] snow match required, keeping ANPR event queued for future snow match")
-                return {
-                    "sent": False,
-                    "status": None,
-                    "error": "waiting_for_snow_match",
-                    "matched_snow": False,
-                }
-
-            with self._lock:
-                self._remove_queued_anpr_event(anpr_time, anpr_event)
-
-        # Если снег так и не найден, ANPR можно отправить без снега только при отключенном mandatory match
+        
+        # Если снег так и не найден, ANPR событие уже в очереди, просто отправляем без снега
         return await self._combine_and_send_internal(anpr_event, detection_bytes, feature_bytes, license_bytes, snow_event, anpr_time)
 
     async def _combine_and_send_internal(
@@ -1240,69 +1173,35 @@ class EventMerger:
             print(f"[MERGER] SKIP duplicate send: plate={plate}, event_time={event_time_iso}")
             return {"sent": False, "status": None, "error": "duplicate_anpr_already_processed"}
 
+        # Помечаем, чтобы второй проход (snow->ANPR или ANPR->snow) не запускал Gemini/отправку повторно
+        self._mark_processed(plate, event_time_iso, now)
+
         if snow_event:
             # Отложенный анализ: вызываем Gemini только когда есть матч с номером
             run_gemini = snow_event.photo_bytes and self._gemini_api_key
 
-            # Опциональная проверка whitelist перед Gemini. По умолчанию не блокирует анализ снега.
+            # Если требуется проверка whitelist, делаем её перед Gemini
             vehicle_exists = None
-            if self._vehicle_check_url and self._require_whitelist_for_gemini:
+            if self._vehicle_check_url:
                 vehicle_exists = await self._check_vehicle_exists(plate)
                 if vehicle_exists is False:
                     print(f"[MERGER] whitelist check failed, skip Gemini: plate={plate}")
                     run_gemini = False
-            elif self._vehicle_check_url and not self._require_whitelist_for_gemini:
-                print(f"[MERGER] whitelist gate disabled for Gemini: plate={plate}")
 
             if run_gemini:
-                if detection_bytes:
-                    plate_photo_2 = None
-                    if feature_bytes and license_bytes:
-                        plate_photo_2 = feature_bytes if len(feature_bytes) >= len(license_bytes) else license_bytes
-                    elif feature_bytes:
-                        plate_photo_2 = feature_bytes
-                    elif license_bytes:
-                        plate_photo_2 = license_bytes
-
-                    camera_plate = str(anpr_event.get("camera_plate") or "").strip() or None
-                    print(
-                        f"[MERGER] Running Gemini combined analysis for matched snow event "
-                        f"(snow={len(snow_event.photo_bytes)} bytes, detection={len(detection_bytes)} bytes)"
-                    )
-                    snow_analysis = await self.analyze_with_gemini(
-                        snow_photo=snow_event.photo_bytes,
-                        plate_photo_1=detection_bytes,
-                        plate_photo_2=plate_photo_2,
-                        camera_plate=camera_plate,
-                    )
-                    print(f"[MERGER] Gemini analysis result: {snow_analysis}")
-                    percentage = snow_analysis.get("snow_percentage", 0.0)
-                    confidence = snow_analysis.get("snow_confidence", 0.0)
-                    combined_event["model_plate"] = snow_analysis.get("model_plate")
-                    combined_event["plate_confidence"] = snow_analysis.get("plate_confidence", 0.0)
-
-                    current_plate = str(combined_event.get("plate") or "").strip()
-                    plate_source = str(combined_event.get("plate_source") or "")
-                    model_plate = snow_analysis.get("model_plate")
-                    if model_plate and (not current_plate or current_plate == "UNKNOWN" or not plate_source.startswith("camera")):
-                        combined_event["plate"] = model_plate
-                else:
-                    print(
-                        f"[MERGER] Detection photo missing, falling back to snow-only Gemini analysis "
-                        f"(photo_size={len(snow_event.photo_bytes)} bytes, bbox={snow_event.payload.get('bbox')})..."
-                    )
-                    snow_analysis = self._analyze_snow_gemini(
-                        snow_event.photo_bytes, snow_event.payload.get("bbox")
-                    )
-                    print(f"[MERGER] Gemini analysis result: {snow_analysis}")
-                    percentage, confidence = self._extract_snow_fields(snow_analysis)
-                    print(f"[MERGER] Extracted snow fields: percentage={percentage}, confidence={confidence}")
+                print(f"[MERGER] Running Gemini analysis for matched snow event (photo_size={len(snow_event.photo_bytes)} bytes, bbox={snow_event.payload.get('bbox')})...")
+                snow_analysis = self._analyze_snow_gemini(
+                    snow_event.photo_bytes, snow_event.payload.get("bbox")
+                )
+                print(f"[MERGER] Gemini analysis result: {snow_analysis}")
+                percentage, confidence = self._extract_snow_fields(snow_analysis)
+                print(f"[MERGER] Extracted snow fields: percentage={percentage}, confidence={confidence}")
             else:
                 if not snow_event.photo_bytes:
                     print("[MERGER] WARNING: snow_event.photo_bytes is None or empty")
                 if not self._gemini_api_key:
                     print("[MERGER] WARNING: GEMINI_API_KEY is not set")
-                if self._vehicle_check_url and self._require_whitelist_for_gemini and vehicle_exists is False:
+                if self._vehicle_check_url and vehicle_exists is False:
                     print("[MERGER] INFO: vehicle not in whitelist, skipping Gemini and snow fields")
                 percentage, confidence = 0.0, 0.0
 
@@ -1313,12 +1212,9 @@ class EventMerger:
                     "matched_snow": True,
                 }
             )
-            snow_event.payload["snow_volume_percentage"] = combined_event["snow_volume_percentage"]
-            snow_event.payload["snow_volume_confidence"] = combined_event["snow_volume_confidence"]
             print(f"[MERGER] Final combined event snow fields: percentage={combined_event.get('snow_volume_percentage')}, confidence={combined_event.get('snow_volume_confidence')}")
             if snow_analysis is not None:
                 combined_event["snow_gemini_raw"] = snow_analysis
-                snow_event.payload["snow_gemini_raw"] = snow_analysis
         else:
             # Всегда заполняем поля о снеге, даже если снег не найден
             combined_event.update(
@@ -1340,10 +1236,6 @@ class EventMerger:
             print("[MERGER] snow match required, skipping upstream send")
             return result
 
-        plate = str(combined_event.get("plate") or plate).strip() or plate
-        # Помечаем только перед реальной отправкой, чтобы поздний снег не потерялся
-        self._mark_processed(plate, event_time_iso, now)
-
         # Логируем номер и формат времени перед отправкой
         plate_value = combined_event.get("plate", "N/A")
         event_time_value = combined_event.get("event_time", "N/A")
@@ -1361,31 +1253,17 @@ class EventMerger:
         
         files = []
 
-        # Upstream должен получать только 2 фото:
-        # 1) номерной кадр
-        # 2) снеговой кадр кузова
-        plate_photo_name = None
-        plate_photo_bytes = None
         if detection_bytes:
-            plate_photo_name = "platePicture.jpg"
-            plate_photo_bytes = detection_bytes
-        elif feature_bytes and license_bytes:
-            if len(feature_bytes) >= len(license_bytes):
-                plate_photo_name = "featurePicture.jpg"
-                plate_photo_bytes = feature_bytes
-            else:
-                plate_photo_name = "licensePlatePicture.jpg"
-                plate_photo_bytes = license_bytes
-        elif feature_bytes:
-            plate_photo_name = "featurePicture.jpg"
-            plate_photo_bytes = feature_bytes
-        elif license_bytes:
-            plate_photo_name = "licensePlatePicture.jpg"
-            plate_photo_bytes = license_bytes
-
-        if plate_photo_bytes and plate_photo_name:
             files.append(
-                ("photos", (plate_photo_name, plate_photo_bytes, "image/jpeg"))
+                ("photos", ("detectionPicture.jpg", detection_bytes, "image/jpeg"))
+            )
+        if feature_bytes:
+            files.append(
+                ("photos", ("featurePicture.jpg", feature_bytes, "image/jpeg"))
+            )
+        if license_bytes:
+            files.append(
+                ("photos", ("licensePlatePicture.jpg", license_bytes, "image/jpeg"))
             )
         if snow_event and snow_event.photo_bytes:
             files.append(
@@ -1418,10 +1296,7 @@ class EventMerger:
                 # Если есть файлы - отправляем multipart/form-data
                 # Если файлов нет - отправляем как JSON (application/json)
                 if files:
-                    print(
-                        f"[MERGER] sending multipart request with {len(files)} files: "
-                        f"{[file_tuple[1][0] for file_tuple in files]}"
-                    )
+                    print(f"[MERGER] sending multipart request with {len(files)} files")
                     print(f"[MERGER] multipart data keys: {list(data.keys())}")
                     resp = await client.post(
                         self.upstream_url,

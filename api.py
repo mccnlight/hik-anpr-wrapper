@@ -443,13 +443,19 @@ async def _process_event_background(
     detection_bytes: bytes | None,
     feature_bytes: bytes | None,
     license_bytes: bytes | None,
+    snow_photo_bytes: bytes | None,
+    plate_photo_1: bytes | None,
+    plate_photo_2: bytes | None,
+    camera_plate_for_gemini: str | None,
+    main_plate: str | None,
     merger: Any,
 ) -> None:
     """
-    Фоновая обработка события через общий EventMerger.
-    Merger сам учитывает оба порядка прихода событий: ANPR -> snow и snow -> ANPR.
+    Фоновая обработка события: Gemini анализ, формирование данных, отправка на upstream.
+    Выполняется асинхронно после отправки ответа камере. Без логирования для скорости.
     """
     try:
+        # Логируем использование памяти в начале обработки
         try:
             process = psutil.Process(os.getpid())
             mem_info = process.memory_info()
@@ -457,46 +463,91 @@ async def _process_event_background(
             print(f"[PROCESS] Memory at start: {mem_mb:.1f} MB")
         except Exception:
             pass
-
-        print(
-            f"[PROCESS] Background processing via merger: "
-            f"plate='{event_data.get('plate')}', "
-            f"detection={'present' if detection_bytes else 'None'}, "
-            f"feature={'present' if feature_bytes else 'None'}, "
-            f"license={'present' if license_bytes else 'None'}"
-        )
-
-        merger_result = await merger.combine_and_send(
-            anpr_event=event_data,
+        # Логируем что получили в фоновой обработке
+        print(f"[PROCESS] Background processing: snow_photo_bytes={'present' if snow_photo_bytes else 'None'} ({len(snow_photo_bytes) if snow_photo_bytes else 0} bytes)")
+        
+        # 1. Вызываем Gemini для анализа (если есть снег и хотя бы одно фото номера)
+        gemini_result = None
+        if snow_photo_bytes and plate_photo_1:
+            try:
+                gemini_result = await merger.analyze_with_gemini(
+                    snow_photo=snow_photo_bytes,
+                    plate_photo_1=plate_photo_1,
+                    plate_photo_2=plate_photo_2,
+                    camera_plate=camera_plate_for_gemini,
+                )
+            except Exception:
+                gemini_result = {"error": "gemini_failed"}
+        
+        # 2. Используем результаты от Gemini
+        # ВАЖНО: Если plate_source начинается с "camera" (т.е. номер уже выбран из камеры),
+        # НЕ перезаписываем его результатом Gemini. Итоговый plate должен остаться camera_plate.
+        final_plate = main_plate
+        plate_source = event_data.get("plate_source", "")
+        
+        # Проверяем, был ли номер выбран из камеры
+        is_camera_plate = (plate_source and plate_source.startswith("camera")) or (camera_plate_for_gemini and camera_plate_for_gemini.lower() not in ["unknown", "none", ""])
+        
+        if is_camera_plate:
+            # Номер уже от камеры - НЕ перезаписываем его результатом Gemini
+            final_plate = main_plate
+            print(f"[PROCESS] Keeping camera plate '{final_plate}' (plate_source='{plate_source}'), ignoring Gemini plate")
+        elif gemini_result and gemini_result.get("model_plate"):
+            # Номер не от камеры - можем использовать результат Gemini
+            final_plate = gemini_result.get("model_plate")
+            print(f"[PROCESS] Using Gemini plate '{final_plate}' (no camera plate)")
+        
+        event_data["plate"] = final_plate
+        
+        # Проверяем, что plate не пустой перед отправкой
+        if not final_plate or final_plate.strip() == "":
+            print(f"[PROCESS] ⚠️ WARNING: plate is empty, using 'UNKNOWN'")
+            event_data["plate"] = "UNKNOWN"
+        
+        # Процент снега и confidence от Gemini
+        snow_percentage = 0.0
+        snow_confidence = 0.0
+        if gemini_result and "error" not in gemini_result:
+            snow_percentage = float(gemini_result.get("snow_percentage", 0.0))
+            snow_confidence = float(gemini_result.get("snow_confidence", 0.0))
+            print(f"[PROCESS] Gemini parsed OK: snow={snow_percentage} conf={snow_confidence}")
+        elif gemini_result and "error" in gemini_result:
+            print(f"[PROCESS] Gemini error: {gemini_result.get('error', 'unknown')}")
+        
+        event_data["snow_volume_percentage"] = snow_percentage
+        event_data["snow_volume_confidence"] = snow_confidence
+        event_data["matched_snow"] = snow_photo_bytes is not None
+        
+        if gemini_result:
+            event_data["gemini_result"] = gemini_result
+        
+        # 3. Отправляем на upstream со всеми фотографиями
+        print(f"[PROCESS] Sending to upstream: plate='{event_data.get('plate')}', snow_bytes={'present' if snow_photo_bytes else 'None'} ({len(snow_photo_bytes) if snow_photo_bytes else 0} bytes)")
+        upstream_result = await send_to_upstream(
+            event_data=event_data,
             detection_bytes=detection_bytes,
             feature_bytes=feature_bytes,
             license_bytes=license_bytes,
+            snow_bytes=snow_photo_bytes,
         )
-
-        if merger_result.get("sent"):
-            print(
-                f"[PROCESS] Event sent by merger: status={merger_result.get('status')} "
-                f"matched_snow={merger_result.get('matched_snow')}"
-            )
-        elif merger_result.get("error") == "processing_by_snow_match":
-            print(
-                f"[PROCESS] Event already claimed by snow-matched path: "
-                f"matched_snow={merger_result.get('matched_snow')}"
-            )
+        
+        # Логируем результат отправки
+        if upstream_result.get("sent"):
+            print(f"[PROCESS] ✅ Event sent: status={upstream_result.get('status')}")
         else:
-            print(
-                f"[PROCESS] Event not sent yet/by design: "
-                f"error={merger_result.get('error', 'unknown')} "
-                f"matched_snow={merger_result.get('matched_snow')}"
-            )
+            print(f"[PROCESS] ❌ Event NOT sent: status={upstream_result.get('status')}, error={upstream_result.get('error', 'unknown')}")
     except Exception as e:
-        print(f"[PROCESS] ERROR: {type(e).__name__}: {e}")
+        # Логируем ошибки для диагностики
+        print(f"[PROCESS] ❌ ERROR: {type(e).__name__}: {e}")
         import traceback
         traceback.print_exc()
     finally:
-        del detection_bytes, feature_bytes, license_bytes
+        # Явно освобождаем память после обработки
+        del detection_bytes, feature_bytes, license_bytes, snow_photo_bytes
+        del plate_photo_1, plate_photo_2
         gc.collect()
-
+        
+        # Логируем использование памяти после освобождения
         try:
             process = psutil.Process(os.getpid())
             mem_info = process.memory_info()
@@ -530,8 +581,9 @@ async def hikvision_isapi(request: Request):
     model_det_conf: float | None = None
     model_ocr_conf: float | None = None
 
-    # Байты картинок из ANPR webhook (держим в памяти, на диск не сохраняем)
+    # Байты трёх картинок (их отправим дальше, но не сохраняем на диск)
     detection_bytes: bytes | None = None
+    snow_photo_bytes: bytes | None = None  # Фото снега (захватывается после получения detectionPicture)
     feature_bytes: bytes | None = None
     license_bytes: bytes | None = None
 
@@ -573,6 +625,26 @@ async def hikvision_isapi(request: Request):
                     if lower_name == "detectionpicture.jpg":
                         detection_bytes = file_bytes
                         print(f"[HIK] ✅ Received detectionPicture.jpg, size={len(detection_bytes)} bytes")
+                        
+                        # КРИТИЧНО: Захватываем фото снега СРАЗУ после получения detectionPicture
+                        # Используем его для поиска похожей машины на снеговом кадре
+                        if ENABLE_SNOW_WORKER:
+                            print(f"[HIK] ENABLE_SNOW_WORKER={ENABLE_SNOW_WORKER}, attempting to capture snow photo...")
+                            try:
+                                from snow_worker import capture_snow_photo
+                                print(f"[HIK] Calling capture_snow_photo with ANPR image (size={len(detection_bytes)} bytes)...")
+                                snow_photo_bytes = capture_snow_photo(anpr_vehicle_image_bytes=detection_bytes)
+                                if snow_photo_bytes:
+                                    print(f"[HIK] ✅ Snow photo captured with ANPR matching, size={len(snow_photo_bytes)} bytes")
+                                else:
+                                    print(f"[HIK] ⚠️ WARNING: Snow photo capture returned None")
+                            except Exception as e:
+                                print(f"[HIK] ❌ ERROR capturing snow photo: {e}")
+                                import traceback
+                                print(f"[HIK] Traceback: {traceback.format_exc()}")
+                                snow_photo_bytes = None
+                        else:
+                            print(f"[HIK] ⚠️ ENABLE_SNOW_WORKER is False, skipping snow photo capture")
 
                     elif lower_name == "featurepicture.jpg":
                         feature_bytes = file_bytes
@@ -733,18 +805,35 @@ async def hikvision_isapi(request: Request):
         event_id = str(uuid.uuid4())
         event_data["event_id"] = event_id
         
-        # 2. Добавляем событие в очередь для фоновой обработки через общий merger
+        # 2. Фото снега захвачено при получении detectionPicture.jpg (с ANPR matching)
+        
+        # 3. Выбираем 2 лучшие фото номеров для Gemini (для фоновой обработки)
+        # Приоритет: detection (всегда), затем feature или license (лучшая по размеру)
+        plate_photo_1 = detection_bytes  # Всегда используем detection
+        plate_photo_2 = None
+        
+        if feature_bytes and license_bytes:
+            # Если есть оба, выбираем большее по размеру
+            if len(feature_bytes) >= len(license_bytes):
+                plate_photo_2 = feature_bytes
+            else:
+                plate_photo_2 = license_bytes
+        elif feature_bytes:
+            plate_photo_2 = feature_bytes
+        elif license_bytes:
+            plate_photo_2 = license_bytes
+        
+        # 4. Добавляем событие в очередь для фоновой обработки
+        camera_plate_for_gemini = camera_plate or main_plate
+        
+        # Устанавливаем начальные значения в event_data (будут обновлены в фоне)
         event_data["plate"] = main_plate
         event_data["snow_volume_percentage"] = 0.0
         event_data["snow_volume_confidence"] = 0.0
-        event_data["matched_snow"] = False
-
-        print(
-            f"[HIK] Adding ANPR event to queue: "
-            f"detection={'present' if detection_bytes else 'None'}, "
-            f"feature={'present' if feature_bytes else 'None'}, "
-            f"license={'present' if license_bytes else 'None'}"
-        )
+        event_data["matched_snow"] = snow_photo_bytes is not None
+        
+        # Логируем что передаем в очередь
+        print(f"[HIK] Adding to queue: snow_photo_bytes={'present' if snow_photo_bytes else 'None'} ({len(snow_photo_bytes) if snow_photo_bytes else 0} bytes)")
         
         # Добавляем в очередь (не блокируем, если очередь полна - просто пропускаем)
         if _event_queue is not None:
@@ -754,6 +843,11 @@ async def hikvision_isapi(request: Request):
                     "detection_bytes": detection_bytes,
                     "feature_bytes": feature_bytes,
                     "license_bytes": license_bytes,
+                    "snow_photo_bytes": snow_photo_bytes,
+                    "plate_photo_1": plate_photo_1,
+                    "plate_photo_2": plate_photo_2,
+                    "camera_plate_for_gemini": camera_plate_for_gemini,
+                    "main_plate": main_plate,
                     "merger": merger,
                 })
                 print(f"[HIK] ✅ Event added to queue successfully")
@@ -824,7 +918,9 @@ async def hikvision_isapi(request: Request):
     now_iso = now_utc.isoformat().replace('+00:00', 'Z')
     event_time = now_iso
     
-    # 2. Подготавливаем данные для фоновой обработки
+    # 2. Фото снега уже захвачено в начале функции (до всех операций)
+    
+    # 3. Подготавливаем данные для фоновой обработки
     event_data: Dict[str, Any] = {
         # контракт бэкенда (обязательные поля)
         "camera_id": PLATE_CAMERA_ID,
@@ -844,7 +940,7 @@ async def hikvision_isapi(request: Request):
         "plate_source": "fallback_model",
         "snow_volume_percentage": 0.0,  # Будет обновлено в фоне после Gemini
         "snow_volume_confidence": 0.0,  # Будет обновлено в фоне после Gemini
-        "matched_snow": False,
+        "matched_snow": snow_photo_bytes is not None,
         "timestamp": now_iso,
     }
 
@@ -856,6 +952,11 @@ async def hikvision_isapi(request: Request):
                 "detection_bytes": jpg_bytes,
                 "feature_bytes": None,
                 "license_bytes": None,
+                "snow_photo_bytes": snow_photo_bytes,
+                "plate_photo_1": jpg_bytes,
+                "plate_photo_2": None,
+                "camera_plate_for_gemini": main_plate,
+                "main_plate": main_plate,
                 "merger": merger,
             })
         except asyncio.QueueFull:
