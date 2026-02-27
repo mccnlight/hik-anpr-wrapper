@@ -478,6 +478,11 @@ async def _process_event_background(
                 f"[PROCESS] Event sent by merger: status={merger_result.get('status')} "
                 f"matched_snow={merger_result.get('matched_snow')}"
             )
+        elif merger_result.get("error") == "processing_by_snow_match":
+            print(
+                f"[PROCESS] Event already claimed by snow-matched path: "
+                f"matched_snow={merger_result.get('matched_snow')}"
+            )
         else:
             print(
                 f"[PROCESS] Event not sent yet/by design: "
