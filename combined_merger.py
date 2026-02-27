@@ -282,6 +282,9 @@ class EventMerger:
             "https://snowops-anpr-service.onrender.com/internal/vehicles/check",
         )
         self._vehicle_check_token = os.getenv("MERGER_VEHICLE_CHECK_TOKEN", "")
+        self._require_whitelist_for_gemini = (
+            os.getenv("MERGER_REQUIRE_WHITELIST_FOR_GEMINI", "false").strip().lower() == "true"
+        )
         self._stop_cleanup = threading.Event()
         self._cleanup_thread = threading.Thread(
             target=self._cleanup_loop, daemon=True, name="merger-cleanup"
@@ -1241,13 +1244,15 @@ class EventMerger:
             # Отложенный анализ: вызываем Gemini только когда есть матч с номером
             run_gemini = snow_event.photo_bytes and self._gemini_api_key
 
-            # Если требуется проверка whitelist, делаем её перед Gemini
+            # Опциональная проверка whitelist перед Gemini. По умолчанию не блокирует анализ снега.
             vehicle_exists = None
-            if self._vehicle_check_url:
+            if self._vehicle_check_url and self._require_whitelist_for_gemini:
                 vehicle_exists = await self._check_vehicle_exists(plate)
                 if vehicle_exists is False:
                     print(f"[MERGER] whitelist check failed, skip Gemini: plate={plate}")
                     run_gemini = False
+            elif self._vehicle_check_url and not self._require_whitelist_for_gemini:
+                print(f"[MERGER] whitelist gate disabled for Gemini: plate={plate}")
 
             if run_gemini:
                 if detection_bytes:
@@ -1297,7 +1302,7 @@ class EventMerger:
                     print("[MERGER] WARNING: snow_event.photo_bytes is None or empty")
                 if not self._gemini_api_key:
                     print("[MERGER] WARNING: GEMINI_API_KEY is not set")
-                if self._vehicle_check_url and vehicle_exists is False:
+                if self._vehicle_check_url and self._require_whitelist_for_gemini and vehicle_exists is False:
                     print("[MERGER] INFO: vehicle not in whitelist, skipping Gemini and snow fields")
                 percentage, confidence = 0.0, 0.0
 
