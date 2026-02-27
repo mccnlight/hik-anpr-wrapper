@@ -15,14 +15,27 @@ import numpy as np
 
 SNOW_VIDEO_SOURCE_URL = os.getenv("SNOW_VIDEO_SOURCE_URL", "")
 SNOW_CAMERA_ID = os.getenv("SNOW_CAMERA_ID", "camera-snow")
-SNOW_CAPTURE_DELAY_SECONDS = float(os.getenv("SNOW_CAPTURE_DELAY_SECONDS", "1.0"))  # Задержка перед захватом фото
+SNOW_CAPTURE_AFTER_LINE_SECONDS = float(os.getenv("SNOW_CAPTURE_AFTER_LINE_SECONDS", "0.5"))
+SNOW_LINE_TRIGGER_COOLDOWN_SECONDS = float(os.getenv("SNOW_LINE_TRIGGER_COOLDOWN_SECONDS", "1.0"))
 
 # Линия пересечения (нормированные координаты 0..1)
 LINE_X1 = float(os.getenv("LINE_X1", "0.1"))
 LINE_Y1 = float(os.getenv("LINE_Y1", "0.8"))
 LINE_X2 = float(os.getenv("LINE_X2", "0.9"))
 LINE_Y2 = float(os.getenv("LINE_Y2", "0.8"))
-LINE_DIRECTION = os.getenv("LINE_DIRECTION", "r2l").strip().lower()  # только r2l (справа налево)
+_LINE_DIRECTION_RAW = os.getenv("LINE_DIRECTION", "r2l").strip().lower()
+LINE_DIRECTION = {
+    "r2l": "r2l",
+    "rtl": "r2l",
+    "right_to_left": "r2l",
+    "backward": "r2l",
+    "l2r": "l2r",
+    "ltr": "l2r",
+    "left_to_right": "l2r",
+    "forward": "l2r",
+    "any": "any",
+    "both": "any",
+}.get(_LINE_DIRECTION_RAW, "r2l")
 
 TRUCK_CLASS_ID = int(os.getenv("SNOW_TRUCK_CLASS_ID", "7"))
 CONFIDENCE_THRESHOLD = float(os.getenv("SNOW_CONFIDENCE_THRESHOLD", "0.55"))
@@ -94,9 +107,13 @@ class TimestampedFrame:
     frame: np.ndarray
     timestamp: float  # time.time()
 
-_frame_buffer: deque[TimestampedFrame] = deque(maxlen=90)  # ~3 секунды при 30 FPS (уменьшено с 300 для экономии памяти)
+BUFFER_DURATION_SECONDS = float(os.getenv("SNOW_BUFFER_DURATION_SECONDS", "15.0"))
+FRAME_BUFFER_MAXLEN = max(
+    90,
+    int(BUFFER_DURATION_SECONDS * max(float(os.getenv("SNOW_FFMPEG_INPUT_FPS", "6.0")), 1.0) * 2),
+)
+_frame_buffer = deque(maxlen=FRAME_BUFFER_MAXLEN)
 _frame_buffer_lock = threading.Lock()
-BUFFER_DURATION_SECONDS = 3.0  # Храним кадры за последние 3 секунды (уменьшено с 10.0 для экономии памяти)
 
 # YOLO модель для детекции грузовиков
 _yolo_model = None
@@ -419,6 +436,32 @@ def _process_frame_for_delay(target_delay: float, current_time: float, model) ->
     if quality_score > 0:
         return (quality_score, best_frame, bbox, vehicles_count, all_vehicles)
     return None
+
+
+def _line_direction_allows_crossing(last_side: int, side: int) -> bool:
+    if side == last_side:
+        return False
+    if LINE_DIRECTION == "any":
+        return True
+    if LINE_DIRECTION == "l2r":
+        return last_side < 0 and side > 0
+    return last_side > 0 and side < 0
+
+
+def _get_buffered_frame_at(target_timestamp: float) -> Optional[TimestampedFrame]:
+    with _frame_buffer_lock:
+        if len(_frame_buffer) == 0:
+            return None
+
+        best_frame = None
+        best_delta = float("inf")
+        for timestamped_frame in _frame_buffer:
+            delta = abs(timestamped_frame.timestamp - target_timestamp)
+            if delta < best_delta:
+                best_delta = delta
+                best_frame = timestamped_frame
+
+        return best_frame
 
 def _check_vehicle_movement(vehicles_by_frame: list) -> Dict[int, bool]:
     """
@@ -958,6 +1001,8 @@ def _snow_loop():
     last_side = None
     last_trigger_ts = 0.0
     last_bbox: Optional[Tuple[int, int, int, int]] = None
+    pending_capture_target_ts: float | None = None
+    pending_capture_bbox: Optional[Tuple[int, int, int, int]] = None
     line_norm = (LINE_X1, LINE_Y1, LINE_X2, LINE_Y2)
 
     _snow_reader = _open_snow_reader()
@@ -1098,11 +1143,11 @@ def _snow_loop():
                 _stop_event.set()
                 break
 
-        # Пересечение линии: по началу пересечения (передняя грань bbox), только справа → налево (R→L)
+        # Пересечение линии: считаем по передней грани bbox и учитываем настроенное направление.
         try:
             if bbox:
                 x1, y1, x2, y2 = bbox
-                # При движении справа налево «нос» грузовика — левая грань bbox; считаем по её центру
+                # Для текущего ракурса передней точкой считаем левую грань bbox.
                 lead_x = x1
                 lead_y = (y1 + y2) // 2
 
@@ -1114,41 +1159,69 @@ def _snow_loop():
                 cross = (bx - ax) * (lead_y - ay) - (by - ay) * (lead_x - ax)
                 side = 1 if cross > 0 else -1
 
-                # Только R→L: считаем пересечение только когда передняя точка перешла с правой стороны линии на левую (last_side > 0 → side < 0)
                 allowed = False
                 if last_side is None:
                     last_side = side
-                elif side != last_side and last_side > 0 and side < 0:
+                elif _line_direction_allows_crossing(last_side, side):
                     allowed = True
 
-                if allowed and (time.time() - last_trigger_ts) > 1.0:
-                    last_trigger_ts = time.time()
+                if allowed and (current_timestamp - last_trigger_ts) > SNOW_LINE_TRIGGER_COOLDOWN_SECONDS:
+                    last_trigger_ts = current_timestamp
+                    pending_capture_target_ts = current_timestamp + SNOW_CAPTURE_AFTER_LINE_SECONDS
+                    pending_capture_bbox = bbox
                     last_side = side
-                    try:
-                        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
-                        if ok:
-                            photo_bytes = buf.tobytes()
-                            payload = {
-                                "event_time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                                "camera_id": SNOW_CAMERA_ID,
-                                "bbox": bbox,
-                                "line": {
-                                    "x1": LINE_X1,
-                                    "y1": LINE_Y1,
-                                    "x2": LINE_X2,
-                                    "y2": LINE_Y2,
-                                    "direction": LINE_DIRECTION,
-                                },
-                            }
-                            if _merger:
-                                _merger.add_snow_event(payload, photo_bytes)
-                                print(f"[SNOW] line crossed, snow event pushed to merger, bytes={len(photo_bytes)}")
-                    except Exception as e:
-                        print(f"[SNOW] error on line crossing capture: {e}")
+                    print(
+                        f"[SNOW] line crossed, scheduled capture in "
+                        f"{SNOW_CAPTURE_AFTER_LINE_SECONDS:.2f}s (direction={LINE_DIRECTION})"
+                    )
                 else:
                     last_side = side
         except Exception:
             pass
+
+        if pending_capture_target_ts is not None and current_timestamp >= pending_capture_target_ts:
+            try:
+                capture_frame = _get_buffered_frame_at(pending_capture_target_ts) or timestamped_frame
+                capture_bbox = pending_capture_bbox
+
+                if model is not None:
+                    try:
+                        capture_score, detected_bbox, _, _ = _assess_frame_quality(
+                            capture_frame.frame,
+                            capture_frame.timestamp,
+                            model,
+                        )
+                        if capture_score > 0 and detected_bbox:
+                            capture_bbox = detected_bbox
+                    except Exception:
+                        pass
+
+                ok, buf = cv2.imencode(".jpg", capture_frame.frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                if ok:
+                    photo_bytes = buf.tobytes()
+                    payload = {
+                        "event_time": datetime.fromtimestamp(capture_frame.timestamp, timezone.utc).isoformat().replace("+00:00", "Z"),
+                        "camera_id": SNOW_CAMERA_ID,
+                        "bbox": capture_bbox,
+                        "line": {
+                            "x1": LINE_X1,
+                            "y1": LINE_Y1,
+                            "x2": LINE_X2,
+                            "y2": LINE_Y2,
+                            "direction": LINE_DIRECTION,
+                        },
+                    }
+                    if _merger:
+                        _merger.add_snow_event(payload, photo_bytes)
+                        print(
+                            f"[SNOW] snow event pushed to merger, bytes={len(photo_bytes)}, "
+                            f"capture_delay={SNOW_CAPTURE_AFTER_LINE_SECONDS:.2f}s"
+                        )
+            except Exception as e:
+                print(f"[SNOW] error on delayed line crossing capture: {e}")
+            finally:
+                pending_capture_target_ts = None
+                pending_capture_bbox = None
 
         # Небольшая пауза, чтобы не грузить CPU
         time.sleep(0.01)
