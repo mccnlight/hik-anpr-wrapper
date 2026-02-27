@@ -374,24 +374,28 @@ async def send_to_upstream(
         print("[UPSTREAM] EVENT JSON:")
         print(event_str)
 
-        # photos — в upstream отправляем только featurePicture и snowSnapshot
+        # photos — порядок важен: кадр 0 → plate_photo_url, кадр 1 → body_photo_url
         files = []
 
-        if feature_bytes:
+        # Кадр 0 — для номера (plate)
+        if detection_bytes:
             print(
-                f"[UPSTREAM] add photo: field='photos', name='featurePicture.jpg', "
-                f"size={len(feature_bytes)}"
+                f"[UPSTREAM] add photo (frame 0, plate): field='photos', name='platePicture.jpg', "
+                f"size={len(detection_bytes)}"
             )
             files.append(
                 (
                     "photos",
-                    ("featurePicture.jpg", feature_bytes, "image/jpeg"),
+                    ("platePicture.jpg", detection_bytes, "image/jpeg"),
                 )
             )
+        else:
+            print(f"[UPSTREAM] ⚠️ WARNING: detection_bytes is None, not adding plate (frame 0)")
 
+        # Кадр 1 — для кузова (body)
         if snow_bytes:
             print(
-                f"[UPSTREAM] ✅ add photo: field='photos', name='snowSnapshot.jpg', "
+                f"[UPSTREAM] ✅ add photo (frame 1, body): field='photos', name='snowSnapshot.jpg', "
                 f"size={len(snow_bytes)} bytes"
             )
             files.append(
@@ -401,7 +405,7 @@ async def send_to_upstream(
                 )
             )
         else:
-            print(f"[UPSTREAM] ⚠️ WARNING: snow_bytes is None, not adding snowSnapshot.jpg")
+            print(f"[UPSTREAM] ⚠️ WARNING: snow_bytes is None, not adding body (frame 1)")
 
         print(f"[UPSTREAM] Sending to: {UPSTREAM_URL}")
         print(f"[UPSTREAM] Event size: {len(event_str)} bytes, Files: {len(files)}")
