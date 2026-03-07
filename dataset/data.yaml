@@ -1,0 +1,15 @@
+# YOLO dataset config for snow detection (truck + snow)
+# Запускай train_yolo.py из корня hik-anpr-wrapper — path тогда dataset (относительно корня).
+# После подготовки датасета: изображения в images/train, images/val;
+# разметка YOLO (один .txt на изображение) в labels/train, labels/val.
+
+path: dataset
+train: images/train
+val: images/val
+
+# Классы (порядок важен: 0 = truck, 1 = snow)
+names:
+  0: truck
+  1: snow
+
+nc: 2

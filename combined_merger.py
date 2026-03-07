@@ -587,6 +587,97 @@ class EventMerger:
             hash_obj.update(plate_photo_2)
         return hash_obj.hexdigest()
 
+    def _get_plate_photos_hash(self, plate_photo_1: bytes, plate_photo_2: bytes | None) -> str:
+        """Хеш только фото номеров (для plate-only Gemini)."""
+        hash_obj = hashlib.md5()
+        hash_obj.update(b"plate_only")
+        hash_obj.update(plate_photo_1)
+        if plate_photo_2:
+            hash_obj.update(plate_photo_2)
+        return hash_obj.hexdigest()
+
+    async def analyze_plate_only_gemini(
+        self,
+        plate_photo_1: bytes,
+        plate_photo_2: bytes | None,
+        camera_plate: str | None = None,
+    ) -> Dict[str, Any]:
+        """
+        Только распознавание номера через Gemini (без анализа снега).
+        Возвращает: { "model_plate": str|None, "plate_confidence": float, "error": str|None }.
+        """
+        photos_hash = self._get_plate_photos_hash(plate_photo_1, plate_photo_2)
+        current_time = time.time()
+        with self._gemini_cache_lock:
+            cache_keys_to_remove = [
+                k for k, (_, ts) in self._gemini_cache.items()
+                if current_time - ts > self._gemini_cache_ttl
+            ]
+            for k in cache_keys_to_remove:
+                del self._gemini_cache[k]
+            if photos_hash in self._gemini_cache:
+                cached, _ = self._gemini_cache[photos_hash]
+                out = {k: cached.get(k) for k in ("model_plate", "plate_confidence", "error") if k in cached}
+                if "model_plate" not in out:
+                    out["model_plate"] = cached.get("plate")
+                return out
+
+        if not self._gemini_api_key:
+            return {"model_plate": None, "plate_confidence": 0.0, "error": "GEMINI_API_KEY is not set"}
+
+        try:
+            import time as time_module
+            start_time = time_module.time()
+            plate_image_1 = Image.open(io.BytesIO(plate_photo_1)).convert("RGB")
+            images = [plate_image_1]
+            if plate_photo_2:
+                plate_image_2 = Image.open(io.BytesIO(plate_photo_2)).convert("RGB")
+                images.append(plate_image_2)
+
+            image3_text = "IMAGE 2: License plate photo 2 - close-up/zoomed view.\n" if plate_photo_2 else ""
+            camera_plate_text = ""
+            if camera_plate and str(camera_plate).strip().lower() not in ("unknown", "none", ""):
+                camera_plate_text = (
+                    f"\nThe camera detected plate '{camera_plate}'. Verify and correct from the images; check Kazakhstan format (regions 01-18).\n"
+                )
+            elif camera_plate and str(camera_plate).strip().lower() == "unknown":
+                camera_plate_text = "\nCamera did not detect a plate. Read the license plate from the images (Kazakhstan format, regions 01-18).\n"
+
+            prompt = (
+                "Recognize the license plate from the image(s). IMAGE 1 is normal view; " + image3_text + camera_plate_text
+                + "Kazakhstan format: 111AAA11 or 111AA11; first two digits = region 01-18. Return ONLY valid JSON, no markdown.\n"
+                "Fields: plate (string or null), plate_confidence (0.0-1.0). Example: {\"plate\": \"035AER15\", \"plate_confidence\": 0.9}\n"
+            )
+            client = self._get_gemini_client()
+            response = client.models.generate_content(model=self._gemini_model, contents=images + [prompt])
+            text = (response.text or "").strip()
+            elapsed = time_module.time() - start_time
+            print(f"[GEMINI] plate-only response in {elapsed:.2f}s, len={len(text)}")
+
+            if not text:
+                result = {"model_plate": None, "plate_confidence": 0.0, "error": "Empty response"}
+            else:
+                result = _extract_json_from_text(text)
+                if result is None:
+                    result = {"model_plate": None, "plate_confidence": 0.0, "error": "Failed to parse JSON"}
+                else:
+                    model_plate = result.get("plate")
+                    plate_confidence = float(result.get("plate_confidence", 0.0))
+                    if model_plate:
+                        model_plate = str(model_plate).strip().upper().replace(" ", "")
+                        if not model_plate or model_plate in ("NULL", "NONE"):
+                            model_plate = None
+                        elif _validate_kazakhstan_plate(model_plate) is None:
+                            model_plate = None
+                    result = {"model_plate": model_plate, "plate_confidence": max(0.0, min(1.0, plate_confidence)), "error": None}
+
+            with self._gemini_cache_lock:
+                self._gemini_cache[photos_hash] = (result.copy(), current_time)
+            return result
+        except Exception as e:
+            print(f"[GEMINI] plate_only exception: {e}")
+            return {"model_plate": None, "plate_confidence": 0.0, "error": str(e)}
+
     async def analyze_with_gemini(
         self,
         snow_photo: bytes,

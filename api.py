@@ -466,12 +466,11 @@ async def _process_event_background(
         # Логируем что получили в фоновой обработке
         print(f"[PROCESS] Background processing: snow_photo_bytes={'present' if snow_photo_bytes else 'None'} ({len(snow_photo_bytes) if snow_photo_bytes else 0} bytes)")
         
-        # 1. Вызываем Gemini для анализа (если есть снег и хотя бы одно фото номера)
+        # 1. Gemini — только распознавание номера (снег не через Gemini)
         gemini_result = None
-        if snow_photo_bytes and plate_photo_1:
+        if plate_photo_1:
             try:
-                gemini_result = await merger.analyze_with_gemini(
-                    snow_photo=snow_photo_bytes,
+                gemini_result = await merger.analyze_plate_only_gemini(
                     plate_photo_1=plate_photo_1,
                     plate_photo_2=plate_photo_2,
                     camera_plate=camera_plate_for_gemini,
@@ -479,47 +478,39 @@ async def _process_event_background(
             except Exception:
                 gemini_result = {"error": "gemini_failed"}
         
-        # 2. Используем результаты от Gemini
-        # ВАЖНО: Если plate_source начинается с "camera" (т.е. номер уже выбран из камеры),
-        # НЕ перезаписываем его результатом Gemini. Итоговый plate должен остаться camera_plate.
+        # 2. Итоговый номер: приоритет камеры, иначе Gemini
         final_plate = main_plate
         plate_source = event_data.get("plate_source", "")
-        
-        # Проверяем, был ли номер выбран из камеры
-        is_camera_plate = (plate_source and plate_source.startswith("camera")) or (camera_plate_for_gemini and camera_plate_for_gemini.lower() not in ["unknown", "none", ""])
-        
+        is_camera_plate = (plate_source and plate_source.startswith("camera")) or (camera_plate_for_gemini and str(camera_plate_for_gemini or "").strip().lower() not in ["unknown", "none", ""])
         if is_camera_plate:
-            # Номер уже от камеры - НЕ перезаписываем его результатом Gemini
             final_plate = main_plate
-            print(f"[PROCESS] Keeping camera plate '{final_plate}' (plate_source='{plate_source}'), ignoring Gemini plate")
+            print(f"[PROCESS] Keeping camera plate '{final_plate}' (plate_source='{plate_source}')")
         elif gemini_result and gemini_result.get("model_plate"):
-            # Номер не от камеры - можем использовать результат Gemini
             final_plate = gemini_result.get("model_plate")
-            print(f"[PROCESS] Using Gemini plate '{final_plate}' (no camera plate)")
-        
+            print(f"[PROCESS] Using Gemini plate '{final_plate}'")
         event_data["plate"] = final_plate
-        
-        # Проверяем, что plate не пустой перед отправкой
         if not final_plate or final_plate.strip() == "":
             print(f"[PROCESS] ⚠️ WARNING: plate is empty, using 'UNKNOWN'")
             event_data["plate"] = "UNKNOWN"
-        
-        # Процент снега и confidence от Gemini
-        snow_percentage = 0.0
-        snow_confidence = 0.0
-        if gemini_result and "error" not in gemini_result:
-            snow_percentage = float(gemini_result.get("snow_percentage", 0.0))
-            snow_confidence = float(gemini_result.get("snow_confidence", 0.0))
-            print(f"[PROCESS] Gemini parsed OK: snow={snow_percentage} conf={snow_confidence}")
-        elif gemini_result and "error" in gemini_result:
-            print(f"[PROCESS] Gemini error: {gemini_result.get('error', 'unknown')}")
-        
-        event_data["snow_volume_percentage"] = snow_percentage
-        event_data["snow_volume_confidence"] = snow_confidence
-        event_data["matched_snow"] = snow_photo_bytes is not None
-        
         if gemini_result:
             event_data["gemini_result"] = gemini_result
+
+        # 3. Снег — локальный YOLO (не Gemini). Результат: snow_detected (bool), detection_confidence (float)
+        snow_detected = False
+        detection_confidence = 0.0
+        if snow_photo_bytes:
+            try:
+                from modules.snow_detection.inference import run_detection_from_bytes
+                snow_detected, detection_confidence = run_detection_from_bytes(snow_photo_bytes)
+                print(f"[PROCESS] YOLO snow: snow_detected={snow_detected}, detection_confidence={detection_confidence}")
+            except Exception as e:
+                print(f"[PROCESS] YOLO snow detection error: {e}")
+        event_data["snow_detected"] = snow_detected
+        event_data["detection_confidence"] = detection_confidence
+        # Обратная совместимость с полями snow_volume_* (бэкенд может их ожидать)
+        event_data["snow_volume_percentage"] = 100.0 if snow_detected else 0.0
+        event_data["snow_volume_confidence"] = detection_confidence
+        event_data["matched_snow"] = snow_photo_bytes is not None
         
         # 3. Отправляем на upstream со всеми фотографиями
         print(f"[PROCESS] Sending to upstream: plate='{event_data.get('plate')}', snow_bytes={'present' if snow_photo_bytes else 'None'} ({len(snow_photo_bytes) if snow_photo_bytes else 0} bytes)")
@@ -826,10 +817,12 @@ async def hikvision_isapi(request: Request):
         # 4. Добавляем событие в очередь для фоновой обработки
         camera_plate_for_gemini = camera_plate or main_plate
         
-        # Устанавливаем начальные значения в event_data (будут обновлены в фоне)
+        # Устанавливаем начальные значения в event_data (будут обновлены в фоне: Gemini — номер, YOLO — снег)
         event_data["plate"] = main_plate
         event_data["snow_volume_percentage"] = 0.0
         event_data["snow_volume_confidence"] = 0.0
+        event_data["snow_detected"] = False
+        event_data["detection_confidence"] = 0.0
         event_data["matched_snow"] = snow_photo_bytes is not None
         
         # Логируем что передаем в очередь
@@ -938,8 +931,10 @@ async def hikvision_isapi(request: Request):
         "model_det_conf": None,
         "model_ocr_conf": None,
         "plate_source": "fallback_model",
-        "snow_volume_percentage": 0.0,  # Будет обновлено в фоне после Gemini
-        "snow_volume_confidence": 0.0,  # Будет обновлено в фоне после Gemini
+        "snow_volume_percentage": 0.0,
+        "snow_volume_confidence": 0.0,
+        "snow_detected": False,
+        "detection_confidence": 0.0,
         "matched_snow": snow_photo_bytes is not None,
         "timestamp": now_iso,
     }

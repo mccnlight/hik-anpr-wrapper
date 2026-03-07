@@ -33,20 +33,22 @@ LINE_Y2=0.700
 LINE_DIRECTION=forward  # any|forward|backward
 SNOW_SHOW_WINDOW=true
 
-# Gemini (для анализа снега/номера)
+# Gemini (только для распознавания номера; снег — локальный YOLO)
 GEMINI_API_KEY=your_key
 GEMINI_MODEL=gemini-2.5-flash
+# Путь к обученной модели снега (truck+snow). После обучения укажи best.pt — см. TRAIN_AND_DEPLOY.md
+# SNOW_YOLO_WEIGHTS=models/training_runs/snow_detection/weights/best.pt
 ```
 
 ## Поток событий
 1) Снеговая камера: воркер буферизует кадры, при пересечении линии грузовиком отправляет фото + метаданные в мерджер.
 2) ANPR камера (Hikvision) шлёт multipart на `/api/v1/anpr/hikvision` с `anpr.xml` и фотографиями. Мы сразу пытаемся захватить кадр снега из буфера.
-3) `EventMerger` матчит снег ↔ ANPR по времени (любой порядок), ждёт «поздний снег» до `WAIT_FOR_SNOW_SECONDS` (если задан, иначе окно). При матче вызывает Gemini (если есть ключ), собирает итоговый `event` и отправляет multipart на `UPSTREAM_URL`.
+3) `EventMerger` матчит снег ↔ ANPR по времени. Gemini используется только для распознавания номера; детекция снега — локальный YOLO (`modules/snow_detection`). Итоговый `event` с полями `snow_detected`, `detection_confidence` отправляется multipart на `UPSTREAM_URL`.
 4) `event_time` всегда текущее локальное время (`LOCAL_TZ_OFFSET_HOURS`).
 5) Если `MERGE_REQUIRE_SNOW_MATCH=true` — без снега не отправляем; иначе шлём с `matched_snow=false`.
 
 ## Что отправляем на внешний сервис (multipart)
-- Поле `event` (JSON): `camera_id`, `event_time` (локальное ISO), `plate` (или `UNKNOWN`), `confidence`, `direction`, `lane`, `vehicle`, `snow_volume_percentage/confidence`, `matched_snow`, `timestamp`, `event_id`, `camera_plate/confidence`, `plate_source`, `xml_event_type`.
+- Поле `event` (JSON): `camera_id`, `event_time`, `plate`, `confidence`, `direction`, `lane`, `vehicle`, `snow_detected`, `detection_confidence`, `snow_volume_percentage/confidence` (для совместимости), `matched_snow`, `timestamp`, `event_id`, `camera_plate/confidence`, `plate_source`, `xml_event_type`.
 - Поле `photos`: `detectionPicture.jpg`, `featurePicture.jpg`/`licensePlatePicture.jpg` (если были), `snowSnapshot.jpg` (если есть кадр снега).
 
 ## Настройка линии (угол и координаты)
@@ -68,6 +70,8 @@ pip install -r requirements.txt
 uvicorn api:app --host 0.0.0.0 --port 8000 --env-file app.env
 ```
 Если `ENABLE_SNOW_WORKER=true`, воркер стартует вместе с приложением. Остановка — Ctrl+C.
+
+Обучение модели снега (YOLO, классы truck + snow): см. **TRAIN_AND_DEPLOY.md** и скрипт `train_yolo.py`.
 
 ## Эндпоинты
 - `GET /` и `GET /health` → `{"status": "ok"}`
