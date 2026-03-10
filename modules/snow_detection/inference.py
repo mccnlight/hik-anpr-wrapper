@@ -43,18 +43,38 @@ def _iou_box(box1: Tuple[float, float, float, float], box2: Tuple[float, float, 
     return inter / union if union > 0 else 0.0
 
 
+# Корень проекта (hik-anpr-wrapper): относительно него задаётся SNOW_YOLO_WEIGHTS
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _resolve_weights_path(path: str) -> Optional[str]:
+    """Путь к best.pt: абсолютный или относительно корня проекта."""
+    if not path or not path.strip():
+        return None
+    path = path.strip()
+    if os.path.isabs(path) and os.path.isfile(path):
+        return path
+    if not os.path.isabs(path):
+        resolved = os.path.join(_PROJECT_ROOT, path)
+        if os.path.isfile(resolved):
+            return resolved
+    return path if os.path.isfile(path) else None
+
+
 def load_model(weights_path: Optional[str] = None):
-    """Ленивая загрузка YOLO-модели. Путь из SNOW_YOLO_WEIGHTS или аргумент."""
+    """Ленивая загрузка YOLO-модели. Путь из SNOW_YOLO_WEIGHTS или аргумент (относительно корня проекта)."""
     global _model
-    path = weights_path or os.getenv("SNOW_YOLO_WEIGHTS", "")
-    # УТОЧНЕНИЕ: если весов ещё нет, можно указать заглушку или пустую строку — тогда run_detection вернёт (False, 0.0)
-    if not path or not os.path.isfile(path):
+    raw = weights_path or os.getenv("SNOW_YOLO_WEIGHTS", "")
+    path = _resolve_weights_path(raw)
+    if not path:
+        print("[SNOW_DETECT] No weights: SNOW_YOLO_WEIGHTS unset or file missing (expected: models/training_runs/snow_detection/weights/best.pt)")
         return None
     with _model_lock:
         if _model is None:
             try:
                 from ultralytics import YOLO
                 _model = YOLO(path)
+                print(f"[SNOW_DETECT] Loaded weights: {path}")
             except Exception as e:
                 print(f"[SNOW_DETECT] Failed to load model {path}: {e}")
                 return None
@@ -98,6 +118,7 @@ def run_detection(
                 snow_boxes.append((x1, y1, x2, y2, conf))
 
     if not truck_boxes:
+        print("[SNOW_DETECT] No truck in frame (snow_detected=False)")
         return False, 0.0
 
     # Лучший грузовик по уверенности (или по площади — уточни при необходимости)
@@ -112,6 +133,7 @@ def run_detection(
             # Снег внутри/пересекается с грузовиком
             return True, float(snow_conf)
 
+    print(f"[SNOW_DETECT] Truck found but no snow in zone (snow_boxes={len(snow_boxes)}, iou>={SNOW_IOU_THRESHOLD})")
     return False, 0.0
 
 

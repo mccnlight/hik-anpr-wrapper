@@ -667,8 +667,9 @@ class EventMerger:
                         model_plate = str(model_plate).strip().upper().replace(" ", "")
                         if not model_plate or model_plate in ("NULL", "NONE"):
                             model_plate = None
-                        elif _validate_kazakhstan_plate(model_plate) is None:
-                            model_plate = None
+                        # Не обнуляем при неуспешной валидации формата — итоговый номер берётся из Gemini в api
+                        # elif _validate_kazakhstan_plate(model_plate) is None:
+                        #     model_plate = None
                     result = {"model_plate": model_plate, "plate_confidence": max(0.0, min(1.0, plate_confidence)), "error": None}
 
             with self._gemini_cache_lock:

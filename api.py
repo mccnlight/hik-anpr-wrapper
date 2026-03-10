@@ -10,7 +10,7 @@ from datetime import timezone, timedelta
 import httpx
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, UploadFile, HTTPException, Request
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 
 from combined_merger import init_merger
@@ -74,7 +74,8 @@ PLATE_CAMERA_ID = os.getenv("PLATE_CAMERA_ID", "camera-001")
 MERGE_WINDOW_SECONDS = int(os.getenv("MERGE_WINDOW_SECONDS", "120"))
 MERGE_TTL_SECONDS = int(os.getenv("MERGE_TTL_SECONDS", "180"))
 ENABLE_SNOW_WORKER = os.getenv("ENABLE_SNOW_WORKER", "false").lower() == "true"
-VEHICLE_CHECK_URL = os.getenv("VEHICLE_CHECK_URL")  # опционально: GET ?plate=KZ123ABC -> 200 если есть
+ENABLE_LINE_PAIRING = os.getenv("ENABLE_LINE_PAIRING", "false").strip().lower() == "true"
+VEHICLE_CHECK_URL = os.getenv("VEHICLE_CHECK_URL")
 VEHICLE_CHECK_TOKEN = os.getenv("VEHICLE_CHECK_TOKEN", "")
 LOCAL_TZ = timezone(timedelta(hours=int(os.getenv("LOCAL_TZ_OFFSET_HOURS", "5"))))
 
@@ -138,6 +139,35 @@ async def _event_queue_worker(worker_name: str):
             import traceback
             traceback.print_exc()
 
+async def _pairing_drain_loop():
+    """Периодически образует пары снег+номер из очередей и кладёт в _event_queue (когда снег пришёл раньше номера)."""
+    from event_pairing import try_match
+    while True:
+        await asyncio.sleep(0.2)
+        if not ENABLE_LINE_PAIRING or _event_queue is None:
+            continue
+        while True:
+            pair = try_match()
+            if pair is None:
+                break
+            snow_bytes, plate_item = pair
+            try:
+                _event_queue.put_nowait({
+                    "event_data": plate_item.event_data,
+                    "detection_bytes": plate_item.detection_bytes,
+                    "feature_bytes": plate_item.feature_bytes,
+                    "license_bytes": plate_item.license_bytes,
+                    "snow_photo_bytes": snow_bytes,
+                    "plate_photo_1": plate_item.plate_photo_1,
+                    "plate_photo_2": plate_item.plate_photo_2,
+                    "camera_plate_for_gemini": plate_item.camera_plate_for_gemini,
+                    "main_plate": plate_item.main_plate,
+                    "merger": plate_item.merger,
+                })
+            except asyncio.QueueFull:
+                break
+
+
 @app.on_event("startup")
 async def start_background_workers():
     global _event_queue, _queue_workers_started
@@ -154,6 +184,10 @@ async def start_background_workers():
         asyncio.create_task(_event_queue_worker(f"worker-{i+1}"))
     _queue_workers_started = True
     print(f"[STARTUP] 3 queue workers started")
+    
+    if ENABLE_LINE_PAIRING:
+        asyncio.create_task(_pairing_drain_loop())
+        print("[STARTUP] Line pairing enabled: snow/plate queues + drain task")
     
     if ENABLE_SNOW_WORKER:
         from snow_worker import start_snow_worker, SNOW_VIDEO_SOURCE_URL
@@ -174,6 +208,31 @@ async def shutdown_workers():
             print("[SHUTDOWN] snow worker stopped")
         except Exception as e:
             print(f"[SHUTDOWN] error stopping snow worker: {e}")
+
+
+@app.post("/api/v1/test/push-snow", summary="Test: push snow frame to pairing queue")
+async def test_push_snow(file: UploadFile = File(..., description="Snow camera frame (JPEG)")) -> JSONResponse:
+    """
+    Для реалистичного теста: имитирует приход кадра снеговой камеры (пересечение линии).
+    Вызови этот endpoint, затем через доли секунды отправь событие номерной камеры (POST /api/v1/anpr/hikvision).
+    Работает только при ENABLE_LINE_PAIRING=true.
+    """
+    if not ENABLE_LINE_PAIRING:
+        raise HTTPException(
+            status_code=400,
+            detail="ENABLE_LINE_PAIRING must be true; set it in app.env for pairing test",
+        )
+    content_type = file.content_type or ""
+    if not content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image (e.g. image/jpeg)")
+    photo_bytes = await file.read()
+    if not photo_bytes:
+        raise HTTPException(status_code=400, detail="Empty file")
+    from event_pairing import push_snow, queue_sizes
+    push_snow(photo_bytes)
+    ns, np_ = queue_sizes()
+    print(f"[TEST] push-snow: +1 frame, snow_queue={ns}, plate_queue={np_}")
+    return JSONResponse(content={"status": "ok", "snow_queue_size": ns, "plate_queue_size": np_})
 
 
 @app.post("/anpr", summary="Recognize Plate")
@@ -451,7 +510,7 @@ async def _process_event_background(
     merger: Any,
 ) -> None:
     """
-    Фоновая обработка события: Gemini анализ, формирование данных, отправка на upstream.
+    Фоновая обработка события: номер с камеры, YOLO по снегу, отправка на upstream.
     Выполняется асинхронно после отправки ответа камере. Без логирования для скорости.
     """
     try:
@@ -466,36 +525,17 @@ async def _process_event_background(
         # Логируем что получили в фоновой обработке
         print(f"[PROCESS] Background processing: snow_photo_bytes={'present' if snow_photo_bytes else 'None'} ({len(snow_photo_bytes) if snow_photo_bytes else 0} bytes)")
         
-        # 1. Gemini — только распознавание номера (снег не через Gemini)
-        gemini_result = None
-        if plate_photo_1:
-            try:
-                gemini_result = await merger.analyze_plate_only_gemini(
-                    plate_photo_1=plate_photo_1,
-                    plate_photo_2=plate_photo_2,
-                    camera_plate=camera_plate_for_gemini,
-                )
-            except Exception:
-                gemini_result = {"error": "gemini_failed"}
-        
-        # 2. Итоговый номер: приоритет камеры, иначе Gemini
-        final_plate = main_plate
-        plate_source = event_data.get("plate_source", "")
-        is_camera_plate = (plate_source and plate_source.startswith("camera")) or (camera_plate_for_gemini and str(camera_plate_for_gemini or "").strip().lower() not in ["unknown", "none", ""])
-        if is_camera_plate:
-            final_plate = main_plate
-            print(f"[PROCESS] Keeping camera plate '{final_plate}' (plate_source='{plate_source}')")
-        elif gemini_result and gemini_result.get("model_plate"):
-            final_plate = gemini_result.get("model_plate")
-            print(f"[PROCESS] Using Gemini plate '{final_plate}'")
+        # 1. Номер — только от камеры (anpr.xml), Gemini в этом сервисе не используется
+        final_plate = main_plate or event_data.get("camera_plate") or None
+        if final_plate and str(final_plate).strip():
+            final_plate = str(final_plate).strip()
+            print(f"[PROCESS] Using camera plate '{final_plate}'")
+        else:
+            final_plate = "UNKNOWN"
+            print(f"[PROCESS] No camera plate, using 'UNKNOWN'")
         event_data["plate"] = final_plate
-        if not final_plate or final_plate.strip() == "":
-            print(f"[PROCESS] ⚠️ WARNING: plate is empty, using 'UNKNOWN'")
-            event_data["plate"] = "UNKNOWN"
-        if gemini_result:
-            event_data["gemini_result"] = gemini_result
 
-        # 3. Снег — локальный YOLO (не Gemini). Результат: snow_detected (bool), detection_confidence (float)
+        # 2. Снег — локальный YOLO. Результат: snow_detected (bool), detection_confidence (float)
         snow_detected = False
         detection_confidence = 0.0
         if snow_photo_bytes:
@@ -512,7 +552,7 @@ async def _process_event_background(
         event_data["snow_volume_confidence"] = detection_confidence
         event_data["matched_snow"] = snow_photo_bytes is not None
         
-        # 3. Отправляем на upstream со всеми фотографиями
+        # 3. Отправка на upstream со всеми фотографиями
         print(f"[PROCESS] Sending to upstream: plate='{event_data.get('plate')}', snow_bytes={'present' if snow_photo_bytes else 'None'} ({len(snow_photo_bytes) if snow_photo_bytes else 0} bytes)")
         upstream_result = await send_to_upstream(
             event_data=event_data,
@@ -617,16 +657,17 @@ async def hikvision_isapi(request: Request):
                         detection_bytes = file_bytes
                         print(f"[HIK] ✅ Received detectionPicture.jpg, size={len(detection_bytes)} bytes")
                         
-                        # КРИТИЧНО: Захватываем фото снега СРАЗУ после получения detectionPicture
-                        # Используем его для поиска похожей машины на снеговом кадре
-                        if ENABLE_SNOW_WORKER:
-                            print(f"[HIK] ENABLE_SNOW_WORKER={ENABLE_SNOW_WORKER}, attempting to capture snow photo...")
+                        # Фото снега: либо по линии (ENABLE_LINE_PAIRING → снег уже в очереди), либо по запросу через capture_snow_photo
+                        if ENABLE_LINE_PAIRING:
+                            # Снег приходит отдельно при пересечении линии; здесь не блокируем
+                            print(f"[HIK] ENABLE_LINE_PAIRING=true, skipping capture_snow_photo (snow from line queue)")
+                        elif ENABLE_SNOW_WORKER:
+                            print(f"[HIK] ENABLE_SNOW_WORKER=true, attempting to capture snow photo...")
                             try:
                                 from snow_worker import capture_snow_photo
-                                print(f"[HIK] Calling capture_snow_photo with ANPR image (size={len(detection_bytes)} bytes)...")
                                 snow_photo_bytes = capture_snow_photo(anpr_vehicle_image_bytes=detection_bytes)
                                 if snow_photo_bytes:
-                                    print(f"[HIK] ✅ Snow photo captured with ANPR matching, size={len(snow_photo_bytes)} bytes")
+                                    print(f"[HIK] ✅ Snow photo captured, size={len(snow_photo_bytes)} bytes")
                                 else:
                                     print(f"[HIK] ⚠️ WARNING: Snow photo capture returned None")
                             except Exception as e:
@@ -635,7 +676,7 @@ async def hikvision_isapi(request: Request):
                                 print(f"[HIK] Traceback: {traceback.format_exc()}")
                                 snow_photo_bytes = None
                         else:
-                            print(f"[HIK] ⚠️ ENABLE_SNOW_WORKER is False, skipping snow photo capture")
+                            print(f"[HIK] ENABLE_SNOW_WORKER is False, skipping snow photo capture")
 
                     elif lower_name == "featurepicture.jpg":
                         feature_bytes = file_bytes
@@ -695,15 +736,13 @@ async def hikvision_isapi(request: Request):
         elif plate_from_model:
             has_valid_confidence = False
 
-        # Если нет валидного номера или уверенности — все равно отправляем в Gemini для попытки распознавания
-        # Gemini может распознать номер даже если камера/модель не смогли
         if not has_valid_plate or not has_valid_confidence:
             print(
                 f"[HIK] ⚠️ WARNING: plate='{main_plate}' reason='{plate_reason}' "
                 f"has_valid_plate={has_valid_plate} has_valid_confidence={has_valid_confidence} "
                 f"camera_conf={camera_conf}"
             )
-            print(f"[HIK] ⚠️ Will still try Gemini recognition (may recognize plate from images)")
+            print(f"[HIK] ⚠️ Will use camera plate or UNKNOWN (no Gemini in this service)")
 
         effective_conf = 0.0
         if plate_from_camera and camera_conf is not None:
@@ -769,7 +808,7 @@ async def hikvision_isapi(request: Request):
             print(f"[HIK] ⚠️ FILTERED EVENT (exiting vehicle): direction='{direction}', event_type='{event_type}', plate='{event_data.get('plate')}'")
             return JSONResponse({"status": "ok"})
         
-        # === НОВАЯ ЛОГИКА: захват снега и анализ через Gemini ===
+        # === Захват снега (при ENABLE_SNOW_WORKER), номер — только с камеры ===
         
         # 0. Проверка дедупликации по номеру от камеры (быстрая проверка)
         current_time_float = time.time()
@@ -798,7 +837,7 @@ async def hikvision_isapi(request: Request):
         
         # 2. Фото снега захвачено при получении detectionPicture.jpg (с ANPR matching)
         
-        # 3. Выбираем 2 лучшие фото номеров для Gemini (для фоновой обработки)
+        # 3. Выбираем фото номеров для передачи в задачу (на upstream уходят как есть)
         # Приоритет: detection (всегда), затем feature или license (лучшая по размеру)
         plate_photo_1 = detection_bytes  # Всегда используем detection
         plate_photo_2 = None
@@ -817,7 +856,7 @@ async def hikvision_isapi(request: Request):
         # 4. Добавляем событие в очередь для фоновой обработки
         camera_plate_for_gemini = camera_plate or main_plate
         
-        # Устанавливаем начальные значения в event_data (будут обновлены в фоне: Gemini — номер, YOLO — снег)
+        # Начальные значения в event_data (в фоне: номер с камеры, YOLO — снег)
         event_data["plate"] = main_plate
         event_data["snow_volume_percentage"] = 0.0
         event_data["snow_volume_confidence"] = 0.0
@@ -825,29 +864,67 @@ async def hikvision_isapi(request: Request):
         event_data["detection_confidence"] = 0.0
         event_data["matched_snow"] = snow_photo_bytes is not None
         
-        # Логируем что передаем в очередь
-        print(f"[HIK] Adding to queue: snow_photo_bytes={'present' if snow_photo_bytes else 'None'} ({len(snow_photo_bytes) if snow_photo_bytes else 0} bytes)")
-        
-        # Добавляем в очередь (не блокируем, если очередь полна - просто пропускаем)
-        if _event_queue is not None:
-            try:
-                _event_queue.put_nowait({
-                    "event_data": event_data,
-                    "detection_bytes": detection_bytes,
-                    "feature_bytes": feature_bytes,
-                    "license_bytes": license_bytes,
-                    "snow_photo_bytes": snow_photo_bytes,
-                    "plate_photo_1": plate_photo_1,
-                    "plate_photo_2": plate_photo_2,
-                    "camera_plate_for_gemini": camera_plate_for_gemini,
-                    "main_plate": main_plate,
-                    "merger": merger,
-                })
-                print(f"[HIK] ✅ Event added to queue successfully")
-            except asyncio.QueueFull:
-                # Очередь переполнена - пропускаем обработку
-                print(f"[HIK] ⚠️ Queue is full, event skipped")
-                pass
+        if ENABLE_LINE_PAIRING:
+            # Режим очередей: номерное событие в plate_queue, пары (снег + номер) образуются по FIFO
+            from event_pairing import push_plate, try_match, queue_sizes
+            push_plate(
+                event_data=event_data,
+                detection_bytes=detection_bytes,
+                feature_bytes=feature_bytes,
+                license_bytes=license_bytes,
+                plate_photo_1=plate_photo_1,
+                plate_photo_2=plate_photo_2,
+                camera_plate_for_gemini=camera_plate_for_gemini,
+                main_plate=main_plate,
+                merger=merger,
+            )
+            ns, np_ = queue_sizes()
+            print(f"[HIK] Plate pushed to pairing queue (snow_q={ns}, plate_q={np_})")
+            paired = 0
+            while _event_queue is not None:
+                pair = try_match()
+                if pair is None:
+                    break
+                snow_bytes, plate_item = pair
+                try:
+                    _event_queue.put_nowait({
+                        "event_data": plate_item.event_data,
+                        "detection_bytes": plate_item.detection_bytes,
+                        "feature_bytes": plate_item.feature_bytes,
+                        "license_bytes": plate_item.license_bytes,
+                        "snow_photo_bytes": snow_bytes,
+                        "plate_photo_1": plate_item.plate_photo_1,
+                        "plate_photo_2": plate_item.plate_photo_2,
+                        "camera_plate_for_gemini": plate_item.camera_plate_for_gemini,
+                        "main_plate": plate_item.main_plate,
+                        "merger": plate_item.merger,
+                    })
+                    paired += 1
+                except asyncio.QueueFull:
+                    print(f"[HIK] ⚠️ Event queue full, paired event skipped")
+                    break
+            if paired:
+                print(f"[HIK] ✅ Paired and added {paired} event(s) to queue")
+        else:
+            # Классический режим: один таск с уже захваченным снегом (или без)
+            print(f"[HIK] Adding to queue: snow_photo_bytes={'present' if snow_photo_bytes else 'None'} ({len(snow_photo_bytes) if snow_photo_bytes else 0} bytes)")
+            if _event_queue is not None:
+                try:
+                    _event_queue.put_nowait({
+                        "event_data": event_data,
+                        "detection_bytes": detection_bytes,
+                        "feature_bytes": feature_bytes,
+                        "license_bytes": license_bytes,
+                        "snow_photo_bytes": snow_photo_bytes,
+                        "plate_photo_1": plate_photo_1,
+                        "plate_photo_2": plate_photo_2,
+                        "camera_plate_for_gemini": camera_plate_for_gemini,
+                        "main_plate": main_plate,
+                        "merger": merger,
+                    })
+                    print(f"[HIK] ✅ Event added to queue successfully")
+                except asyncio.QueueFull:
+                    print(f"[HIK] ⚠️ Queue is full, event skipped")
         
         # 5. Моментальный ответ камере (не ждем обработки)
         return JSONResponse({"status": "ok"})
@@ -873,7 +950,7 @@ async def hikvision_isapi(request: Request):
     # Используем UTC timezone для RFC3339 формата (требуется Go)
     now_iso = datetime.datetime.now(LOCAL_TZ).isoformat()
 
-    # тут камеры нет, оставляем plate=None и позволяем Gemini распознать в фоне
+    # тут камеры нет, оставляем plate=None (в фоне будет UNKNOWN)
     main_plate = None
 
     # === НОВАЯ ЛОГИКА для fallback варианта ===
@@ -919,7 +996,7 @@ async def hikvision_isapi(request: Request):
         "camera_id": PLATE_CAMERA_ID,
         "event_time": now_iso,  # RFC3339 формат с timezone
         "event_id": event_id,
-        "plate": main_plate,  # Будет обновлено в фоне после Gemini
+        "plate": main_plate,  # В фоне берётся с камеры или UNKNOWN
         "confidence": 0.0,  # обязательное поле
         "direction": "unknown",  # обязательное поле
         "lane": 0,  # обязательное поле

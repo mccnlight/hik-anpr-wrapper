@@ -46,6 +46,9 @@ STATIONARY_HARD_TIMEOUT_SECONDS = float(os.getenv("SNOW_STATIONARY_HARD_TIMEOUT_
 LEAVE_RESET_THRESHOLD = int(os.getenv("SNOW_LEAVE_RESET_THRESHOLD", "12"))  # Сколько кадров подряд без детекта считать, что машина ушла
 SNOW_ALLOW_R2L_EVENT = os.getenv("SNOW_ALLOW_R2L_EVENT", "false").lower() == "true"  # Разрешать событие даже при движении R→L
 
+# Режим сопоставления по очередям: снег при пересечении линии кладётся в snow_queue, номерные события — в plate_queue, пары обрабатываются воркерами
+ENABLE_LINE_PAIRING = os.getenv("ENABLE_LINE_PAIRING", "false").strip().lower() == "true"
+
 # Окно предпросмотра (включаем через переменную окружения SNOW_SHOW_WINDOW=true)
 SHOW_WINDOW = os.getenv("SNOW_SHOW_WINDOW", "false").strip().lower() == "true"
 
@@ -1140,7 +1143,14 @@ def _snow_loop():
                                     "direction": LINE_DIRECTION,
                                 },
                             }
-                            if _merger:
+                            if ENABLE_LINE_PAIRING:
+                                try:
+                                    from event_pairing import push_snow
+                                    push_snow(photo_bytes)
+                                    print(f"[SNOW] line crossed, snow pushed to pairing queue, bytes={len(photo_bytes)}")
+                                except Exception as e:
+                                    print(f"[SNOW] error pushing to pairing queue: {e}")
+                            elif _merger:
                                 _merger.add_snow_event(payload, photo_bytes)
                                 print(f"[SNOW] line crossed, snow event pushed to merger, bytes={len(photo_bytes)}")
                     except Exception as e:

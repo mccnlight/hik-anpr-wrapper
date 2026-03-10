@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Event xmlns:isapi="http://www.isapi.org/ver20/XMLSchema">
+  <isapi:eventType>ANPR</isapi:eventType>
+  <isapi:dateTime>2026-03-07T12:00:00</isapi:dateTime>
+  <isapi:ANPR>
+    <isapi:licensePlate>X123XX99</isapi:licensePlate>
+    <isapi:confidenceLevel>90</isapi:confidenceLevel>
+    <isapi:direction>entry</isapi:direction>
+    <isapi:lane>1</isapi:lane>
+  </isapi:ANPR>
+</Event>
