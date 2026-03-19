@@ -626,11 +626,11 @@ class EventMerger:
             # Проверяем, не обрабатывали ли мы уже эти фотографии
             if photos_hash in self._gemini_cache:
                 cached_result, _ = self._gemini_cache[photos_hash]
-                print(f"[GEMINI] Using cached result for photos hash {photos_hash[:8]}... (duplicate request skipped)")
+                print(f"[yolov8n] Using cached result for photos hash {photos_hash[:8]}... (duplicate request skipped)")
                 return cached_result.copy()  # Возвращаем копию, чтобы не изменять кэш
         
         if not self._gemini_api_key:
-            print("[GEMINI] ERROR: GEMINI_API_KEY is not set")
+            print("[yolov8n] ERROR: GEMINI_API_KEY is not set")
             return {
                 "error": "GEMINI_API_KEY is not set",
                 "snow_percentage": 0.0,
@@ -652,7 +652,7 @@ class EventMerger:
                 plate_image_2 = Image.open(io.BytesIO(plate_photo_2)).convert("RGB")
                 images.append(plate_image_2)
             
-            print(f"[GEMINI] Starting analysis: snow_image={snow_image.size}, "
+            print(f"[yolov8n] Starting analysis: snow_image={snow_image.size}, "
                   f"plate_image_1={plate_image_1.size}, "
                   f"plate_image_2={'present' if plate_photo_2 else 'none'}")
 
@@ -786,7 +786,7 @@ class EventMerger:
                 "Invalid examples: 119AB115 (region 119 doesn't exist), 200AB15 (region 20 doesn't exist).\n"
             )
             
-            print(f"[GEMINI] Sending request to model={self._gemini_model}, "
+            print(f"[yolov8n] Sending request to model={self._gemini_model}, "
                   f"images_count={len(images)}, prompt_length={len(prompt)} chars")
 
             client = self._get_gemini_client()
@@ -797,16 +797,16 @@ class EventMerger:
             
             request_duration = time_module.time() - start_time
             text = (response.text or "").strip()
-            print(f"[GEMINI] Response received in {request_duration:.2f}s, response_length={len(text)} chars")
+            print(f"[yolov8n] Response received in {request_duration:.2f}s, response_length={len(text)} chars")
             
             # Логируем первые 300 символов (без бинарных данных)
             preview_text = text[:300] if len(text) <= 300 else text[:300] + "..."
             # Убираем бинарные символы из лога
             preview_text = ''.join(c if 32 <= ord(c) < 127 or c in '\n\r\t' else '.' for c in preview_text)
-            print(f"[GEMINI] Raw response preview: {preview_text}")
+            print(f"[yolov8n] Raw response preview: {preview_text}")
             
             if not text:
-                print("[GEMINI] ERROR: Empty response from Gemini")
+                print("[yolov8n] ERROR: Empty response from Gemini")
                 return {
                     "error": "Empty response from Gemini",
                     "snow_percentage": 0.0,
@@ -822,8 +822,8 @@ class EventMerger:
             if result is None:
                 # Не удалось извлечь JSON - логируем ошибку и возвращаем с raw
                 error_msg = "Failed to extract JSON from response"
-                print(f"[GEMINI] ERROR: {error_msg}")
-                print(f"[GEMINI] Failed response preview: {preview_text}")
+                print(f"[yolov8n] ERROR: {error_msg}")
+                print(f"[yolov8n] Failed response preview: {preview_text}")
                 return {
                     "raw": original_text[:1000],  # Сохраняем первые 1000 символов
                     "error": error_msg,
@@ -833,7 +833,7 @@ class EventMerger:
                     "plate_confidence": 0.0,
                 }
             
-            print(f"[GEMINI] Successfully parsed JSON: snow={result.get('snow_percentage', 0.0)}, conf={result.get('snow_confidence', 0.0)}")
+            print(f"[yolov8n] Successfully parsed JSON: snow={result.get('snow_percentage', 0.0)}, conf={result.get('snow_confidence', 0.0)}")
             
             # Нормализуем результат
             snow_percentage = result.get("snow_percentage", 0.0)
@@ -874,13 +874,13 @@ class EventMerger:
             if model_plate_normalized:
                 validated_plate = _validate_kazakhstan_plate(model_plate_normalized)
                 if validated_plate != model_plate_normalized:
-                    print(f"[GEMINI] Model plate validation failed: '{model_plate_normalized}' -> None (invalid Kazakhstan format)")
+                    print(f"[yolov8n] Model plate validation failed: '{model_plate_normalized}' -> None (invalid Kazakhstan format)")
                     model_plate_normalized = None
                 elif validated_plate is None:
-                    print(f"[GEMINI] Model plate validation failed: '{model_plate_normalized}' -> None (invalid format)")
+                    print(f"[yolov8n] Model plate validation failed: '{model_plate_normalized}' -> None (invalid format)")
                     model_plate_normalized = None
                 else:
-                    print(f"[GEMINI] Model plate validation passed: '{model_plate_normalized}'")
+                    print(f"[yolov8n] Model plate validation passed: '{model_plate_normalized}'")
             
             result = {
                 "snow_percentage": snow_percentage,
@@ -895,9 +895,9 @@ class EventMerger:
             
             return result
         except Exception as e:
-            print(f"[GEMINI] EXCEPTION: {type(e).__name__}: {e}")
+            print(f"[yolov8n] EXCEPTION: {type(e).__name__}: {e}")
             import traceback
-            print(f"[GEMINI] Traceback: {traceback.format_exc()}")
+            print(f"[yolov8n] Traceback: {traceback.format_exc()}")
             return {
                 "error": str(e),
                 "snow_percentage": 0.0,
@@ -914,7 +914,7 @@ class EventMerger:
         (Старая функция, оставлена для обратной совместимости, но больше не используется)
         """
         if not self._gemini_api_key:
-            print("[GEMINI] ERROR: GEMINI_API_KEY is not set")
+            print("[yolov8n] ERROR: GEMINI_API_KEY is not set")
             return {"error": "GEMINI_API_KEY is not set"}
 
         try:
@@ -923,7 +923,7 @@ class EventMerger:
             
             image = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
             original_size = (image.width, image.height)
-            print(f"[GEMINI] Starting analysis: original image size={original_size}, bbox={bbox}")
+            print(f"[yolov8n] Starting analysis: original image size={original_size}, bbox={bbox}")
 
             if bbox:
                 try:
@@ -934,9 +934,9 @@ class EventMerger:
                     x2 = min(image.width, x2 + padding)
                     y2 = min(image.height, y2 + padding)
                     image = image.crop((x1, y1, x2, y2))
-                    print(f"[GEMINI] Cropped image: size=({image.width}, {image.height}), crop=({x1},{y1},{x2},{y2})")
+                    print(f"[yolov8n] Cropped image: size=({image.width}, {image.height}), crop=({x1},{y1},{x2},{y2})")
                 except Exception as e:
-                    print(f"[GEMINI] WARNING: Failed to crop image: {e}")
+                    print(f"[yolov8n] WARNING: Failed to crop image: {e}")
 
             prompt = (
                 "You see the OPEN cargo bed of a truck. Classify ONLY loose/bulk snow inside the bed.\n"
@@ -966,7 +966,7 @@ class EventMerger:
                 '  \"confidence\": 0.95\n'
                 "}\n"
             )
-            print(f"[GEMINI] Sending request to model={self._gemini_model}, prompt_length={len(prompt)} chars")
+            print(f"[yolov8n] Sending request to model={self._gemini_model}, prompt_length={len(prompt)} chars")
 
             client = self._get_gemini_client()
             response = client.models.generate_content(
@@ -976,15 +976,15 @@ class EventMerger:
             
             request_duration = time_module.time() - start_time
             text = (response.text or "").strip()
-            print(f"[GEMINI] Response received in {request_duration:.2f}s, response_length={len(text)} chars")
+            print(f"[yolov8n] Response received in {request_duration:.2f}s, response_length={len(text)} chars")
             
             # Логируем первые 300 символов (без бинарных данных)
             preview_text = text[:300] if len(text) <= 300 else text[:300] + "..."
             preview_text = ''.join(c if 32 <= ord(c) < 127 or c in '\n\r\t' else '.' for c in preview_text)
-            print(f"[GEMINI] Raw response preview: {preview_text}")
+            print(f"[yolov8n] Raw response preview: {preview_text}")
             
             if not text:
-                print("[GEMINI] ERROR: Empty response from Gemini")
+                print("[yolov8n] ERROR: Empty response from Gemini")
                 return {"error": "Empty response from Gemini", "percentage": 0.0, "confidence": 0.0}
 
             # Используем надежное извлечение JSON
@@ -993,16 +993,16 @@ class EventMerger:
             
             if result is None:
                 error_msg = "Failed to extract JSON from response"
-                print(f"[GEMINI] ERROR: {error_msg}")
-                print(f"[GEMINI] Failed response preview: {preview_text}")
+                print(f"[yolov8n] ERROR: {error_msg}")
+                print(f"[yolov8n] Failed response preview: {preview_text}")
                 return {"raw": original_text[:1000], "error": error_msg, "percentage": 0.0, "confidence": 0.0}
             
-            print(f"[GEMINI] Successfully parsed JSON: percentage={result.get('percentage', 0.0)}, confidence={result.get('confidence', 0.0)}")
+            print(f"[yolov8n] Successfully parsed JSON: percentage={result.get('percentage', 0.0)}, confidence={result.get('confidence', 0.0)}")
             return result
         except Exception as e:
-            print(f"[GEMINI] EXCEPTION: {type(e).__name__}: {e}")
+            print(f"[yolov8n] EXCEPTION: {type(e).__name__}: {e}")
             import traceback
-            print(f"[GEMINI] Traceback: {traceback.format_exc()}")
+            print(f"[yolov8n] Traceback: {traceback.format_exc()}")
             return {"error": str(e), "percentage": 0.0, "confidence": 0.0}
 
     @staticmethod
