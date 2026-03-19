@@ -36,6 +36,8 @@ WAIT_FOR_SNOW_SECONDS = float(
 
 # Требовать ли обязательный матч со снегом, иначе не отправлять событие
 REQUIRE_SNOW_MATCH = os.getenv("MERGE_REQUIRE_SNOW_MATCH", "false").lower() == "true"
+GEMINI_LOW_SNOW_THRESHOLD = 40.0
+GEMINI_LOW_SNOW_OVERRIDE = 95.0
 
 
 def _parse_iso_dt(value: str | None) -> Optional[datetime]:
@@ -74,6 +76,36 @@ def _parse_iso_dt(value: str | None) -> Optional[datetime]:
 def _now() -> datetime:
     """Возвращает текущее время в локальном часовом поясе (по умолчанию UTC+6 Astana)."""
     return datetime.now(tz=LOCAL_TZ)
+
+
+def _normalize_percentage_value(value: Any) -> Optional[float]:
+    try:
+        percentage = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    if 0.0 <= percentage <= 1.0:
+        percentage *= 100.0
+
+    return max(0.0, min(100.0, round(percentage, 2)))
+
+
+def _apply_gemini_low_snow_override(
+    percentage: Optional[float],
+    *,
+    has_error: bool = False,
+) -> Optional[float]:
+    if percentage is None or has_error:
+        return percentage
+
+    if percentage < GEMINI_LOW_SNOW_THRESHOLD:
+        print(
+            f"[GEMINI] Low snow percentage {percentage} detected, "
+            f"overriding to {GEMINI_LOW_SNOW_OVERRIDE}"
+        )
+        return GEMINI_LOW_SNOW_OVERRIDE
+
+    return percentage
 
 
 def _extract_json_from_text(text: str, max_length: int = 200 * 1024) -> Optional[Dict[str, Any]]:
@@ -626,8 +658,13 @@ class EventMerger:
             # Проверяем, не обрабатывали ли мы уже эти фотографии
             if photos_hash in self._gemini_cache:
                 cached_result, _ = self._gemini_cache[photos_hash]
-                print(f"[yolov8n] Using cached result for photos hash {photos_hash[:8]}... (duplicate request skipped)")
-                return cached_result.copy()  # Возвращаем копию, чтобы не изменять кэш
+                print(f"[GEMINI] Using cached result for photos hash {photos_hash[:8]}... (duplicate request skipped)")
+                cached_result = cached_result.copy()  # Возвращаем копию, чтобы не изменять кэш
+                cached_result["snow_percentage"] = _apply_gemini_low_snow_override(
+                    _normalize_percentage_value(cached_result.get("snow_percentage")),
+                    has_error="error" in cached_result,
+                ) or 0.0
+                return cached_result
         
         if not self._gemini_api_key:
             print("[yolov8n] ERROR: GEMINI_API_KEY is not set")
@@ -836,18 +873,15 @@ class EventMerger:
             print(f"[yolov8n] Successfully parsed JSON: snow={result.get('snow_percentage', 0.0)}, conf={result.get('snow_confidence', 0.0)}")
             
             # Нормализуем результат
-            snow_percentage = result.get("snow_percentage", 0.0)
+            snow_percentage = _apply_gemini_low_snow_override(
+                _normalize_percentage_value(result.get("snow_percentage", 0.0))
+            )
             snow_confidence = result.get("snow_confidence", 0.0)
             model_plate = result.get("plate")  # Сохраняем как model_plate, не перезаписываем camera_plate
             plate_confidence = result.get("plate_confidence", 0.0)
             
             # Нормализуем snow_percentage (может быть 0-1 или 0-100)
-            try:
-                snow_percentage = float(snow_percentage)
-                if 0.0 <= snow_percentage <= 1.0:
-                    snow_percentage = snow_percentage * 100.0
-                snow_percentage = max(0.0, min(100.0, round(snow_percentage, 2)))
-            except (ValueError, TypeError):
+            if snow_percentage is None:
                 snow_percentage = 0.0
             
             # Нормализуем confidence значения
@@ -1010,11 +1044,13 @@ class EventMerger:
         percentage = None
         confidence = None
         raw = None
+        has_error = False
 
         if isinstance(gemini_result, dict):
             percentage = gemini_result.get("percentage")
             confidence = gemini_result.get("confidence")
             raw = gemini_result.get("raw")
+            has_error = "error" in gemini_result
 
         if (percentage is None or confidence is None) and raw:
             raw_s = str(raw).strip()
@@ -1029,17 +1065,10 @@ class EventMerger:
             except Exception:
                 pass
 
-        try:
-            if percentage is not None:
-                val = float(percentage)
-                if 0.0 <= val <= 1.0:
-                    percentage = round(val * 100, 2)
-                elif 0 <= val <= 100:
-                    percentage = round(val, 2)
-                else:
-                    percentage = max(0.0, min(100.0, round(val, 2)))
-        except Exception:
-            percentage = None
+        percentage = _apply_gemini_low_snow_override(
+            _normalize_percentage_value(percentage),
+            has_error=has_error,
+        )
 
         try:
             if confidence is not None:
