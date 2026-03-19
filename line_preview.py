@@ -63,15 +63,25 @@ LINE_Y2 = float(os.getenv("LINE_Y2", str(DEFAULT_LINE[3])))
 STEP_SMALL = 0.005
 STEP_BIG = 0.02
 
-# Настройки детекции грузовиков
-TRUCK_CLASS_ID = int(os.getenv("SNOW_TRUCK_CLASS_ID", "7"))
-YOLO_MODEL_PATH = os.getenv("SNOW_YOLO_MODEL_PATH", "yolov8n.pt")
+# Настройки детекции для предпросмотра
+_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+_CUSTOM_WEIGHTS_RAW = os.getenv("SNOW_YOLO_WEIGHTS", "").strip()
+_FALLBACK_MODEL_RAW = os.getenv("SNOW_YOLO_MODEL_PATH", "yolov8n.pt").strip()
+_USE_CUSTOM_MODEL = bool(_CUSTOM_WEIGHTS_RAW)
+
+TRUCK_CLASS_ID = int(os.getenv("SNOW_TRUCK_CLASS_ID", "0" if _USE_CUSTOM_MODEL else "7"))
+SNOW_CLASS_ID = int(os.getenv("SNOW_SNOW_CLASS_ID", "1"))
+YOLO_MODEL_PATH = _CUSTOM_WEIGHTS_RAW or _FALLBACK_MODEL_RAW
 PREVIEW_MIN_CONF = 0.25  # Мягкий порог для предпросмотра
 PREVIEW_MIN_AREA = 500   # Минимальная площадь
 PREVIEW_MIN_W = 20       # Минимальная ширина
 PREVIEW_MIN_H = 20       # Минимальная высота
 SQUARE_SCALE = float(os.getenv("SNOW_SQUARE_SCALE", "1.2"))
 SQUARE_MIN_SIZE = int(os.getenv("SNOW_SQUARE_MIN_SIZE", "60"))
+PREVIEW_OVERLAP_IOU = float(os.getenv("SNOW_PREVIEW_OVERLAP_IOU", "0.05"))
+PREVIEW_MIN_SNOW_IN_TRUCK = float(os.getenv("SNOW_PREVIEW_MIN_SNOW_IN_TRUCK", "0.30"))
+PREVIEW_DEDUP_IOU = float(os.getenv("SNOW_PREVIEW_DEDUP_IOU", "0.45"))
+PREVIEW_MODEL_IOU = float(os.getenv("SNOW_PREVIEW_MODEL_IOU", "0.45"))
 
 # Глобальная переменная для YOLO модели
 _yolo_model = None
@@ -113,9 +123,14 @@ def _get_yolo_model():
     if _yolo_model is None:
         try:
             from ultralytics import YOLO
-            if os.path.exists(YOLO_MODEL_PATH):
-                _yolo_model = YOLO(YOLO_MODEL_PATH)
-                print(f"[LINE-PREVIEW] YOLO model loaded: {YOLO_MODEL_PATH}")
+            model_path = YOLO_MODEL_PATH
+            if model_path and not os.path.isabs(model_path):
+                candidate = os.path.join(_PROJECT_ROOT, model_path)
+                if os.path.exists(candidate):
+                    model_path = candidate
+            if os.path.exists(model_path):
+                _yolo_model = YOLO(model_path)
+                print(f"[LINE-PREVIEW] YOLO model loaded: {model_path}")
             else:
                 print(f"[LINE-PREVIEW] WARNING: YOLO model not found at {YOLO_MODEL_PATH}")
         except ImportError:
@@ -125,19 +140,16 @@ def _get_yolo_model():
     return _yolo_model
 
 
-def _detect_trucks_for_preview(frame: np.ndarray, model) -> list:
-    """Детектирует грузовики для предпросмотра с мягкими фильтрами"""
+def _detect_for_preview(frame: np.ndarray, model) -> list:
+    """Детектирует объекты для предпросмотра (truck/snow для custom-модели)."""
     if model is None:
         return []
     
-    fh, fw = frame.shape[:2]
-    vehicles = []
-    
-    # Классы для детекции: грузовик (7), автобус (5), машина (2)
-    PREVIEW_VEHICLE_CLASSES = [TRUCK_CLASS_ID, 5, 2]
+    detections = []
+    preview_vehicle_classes = [TRUCK_CLASS_ID, 5, 2]
     
     try:
-        results = model(frame, verbose=False)
+        results = model(frame, verbose=False, conf=PREVIEW_MIN_CONF, iou=PREVIEW_MODEL_IOU)
         for r in results:
             boxes = r.boxes
             if boxes is None:
@@ -145,8 +157,14 @@ def _detect_trucks_for_preview(frame: np.ndarray, model) -> list:
             for b in boxes:
                 cls_id = int(b.cls[0].item())
                 conf = float(b.conf[0].item())
-                if cls_id not in PREVIEW_VEHICLE_CLASSES or conf < PREVIEW_MIN_CONF:
-                    continue
+                if _USE_CUSTOM_MODEL:
+                    # Для обученной модели ожидаем truck=0 и snow=1.
+                    if cls_id not in (TRUCK_CLASS_ID, SNOW_CLASS_ID) or conf < PREVIEW_MIN_CONF:
+                        continue
+                else:
+                    # Для базовой COCO-модели показываем крупный транспорт.
+                    if cls_id not in preview_vehicle_classes or conf < PREVIEW_MIN_CONF:
+                        continue
                 x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
                 w = x2 - x1
                 h = y2 - y1
@@ -154,17 +172,82 @@ def _detect_trucks_for_preview(frame: np.ndarray, model) -> list:
                 
                 if area < PREVIEW_MIN_AREA or w < PREVIEW_MIN_W or h < PREVIEW_MIN_H:
                     continue
-                
-                vehicles.append({
+
+                label = "snow" if _USE_CUSTOM_MODEL and cls_id == SNOW_CLASS_ID else "truck"
+                detections.append({
                     'bbox': (x1, y1, x2, y2),
                     'conf': conf,
-                    'class_id': cls_id
+                    'class_id': cls_id,
+                    'label': label,
                 })
     except Exception as e:
         print(f"[LINE-PREVIEW] Error in truck detection: {e}")
         return []
     
-    return vehicles
+    return detections
+
+
+def _iou_box(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+    inter = (ix2 - ix1) * (iy2 - iy1)
+    area_a = max(1, (ax2 - ax1) * (ay2 - ay1))
+    area_b = max(1, (bx2 - bx1) * (by2 - by1))
+    return inter / float(area_a + area_b - inter)
+
+
+def _dedupe_by_iou(detections: list, iou_thr: float) -> list:
+    """Убирает дубли боксов одного класса (оставляет более уверенный)."""
+    if not detections:
+        return []
+    ordered = sorted(detections, key=lambda d: float(d.get("conf", 0.0)), reverse=True)
+    kept = []
+    for det in ordered:
+        box = det.get("bbox")
+        if not box:
+            continue
+        cls_id = det.get("class_id")
+        duplicate = False
+        for k in kept:
+            if k.get("class_id") != cls_id:
+                continue
+            if _iou_box(box, k.get("bbox")) >= iou_thr:
+                duplicate = True
+                break
+        if not duplicate:
+            kept.append(det)
+    return kept
+
+
+def _intersection_ratio(inner_box: Tuple[int, int, int, int], outer_box: Tuple[int, int, int, int]) -> float:
+    """Доля inner_box, покрытая outer_box: intersection_area / area(inner_box)."""
+    ix = _iou_box(inner_box, outer_box)
+    if ix <= 0.0:
+        return 0.0
+    # Восстанавливаем через явное пересечение, чтобы не зависеть от IoU.
+    ax1, ay1, ax2, ay2 = inner_box
+    bx1, by1, bx2, by2 = outer_box
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+    inter = (ix2 - ix1) * (iy2 - iy1)
+    inner_area = max(1, (ax2 - ax1) * (ay2 - ay1))
+    return inter / float(inner_area)
+
+
+def _center_inside(inner_box: Tuple[int, int, int, int], outer_box: Tuple[int, int, int, int]) -> bool:
+    cx = (inner_box[0] + inner_box[2]) / 2.0
+    cy = (inner_box[1] + inner_box[3]) / 2.0
+    return outer_box[0] <= cx <= outer_box[2] and outer_box[1] <= cy <= outer_box[3]
 
 
 def _make_dynamic_square(bbox: Tuple[int, int, int, int], frame_width: int, frame_height: int) -> Tuple[int, int, int, int]:
@@ -235,25 +318,64 @@ def _draw_overlay(frame: np.ndarray, state: LineState, selected_point: str, fps:
 
     out = frame.copy()
     
-    # Детектируем грузовики и рисуем квадраты
+    # Детектируем объекты и рисуем боксы из модели
     model = _get_yolo_model()
     if model is not None:
-        trucks = _detect_trucks_for_preview(out, model)
-        for truck in trucks:
-            bbox = truck.get('bbox')
-            class_id = truck.get('class_id', -1)
+        detections = _detect_for_preview(out, model)
+        detections = _dedupe_by_iou(detections, PREVIEW_DEDUP_IOU)
+        trucks = [d for d in detections if d.get("label") == "truck"]
+        snows = [d for d in detections if d.get("label") == "snow"]
+
+        # Снег валиден только если реально находится в truck:
+        # 1) центр снегового бокса внутри truck
+        # 2) значительная часть snow-бокса лежит в truck
+        # 3) есть минимальное пересечение по IoU
+        valid_snow = []
+        for s in snows:
+            sb = s.get("bbox")
+            if not sb:
+                continue
+            if any(
+                _iou_box(sb, tb) >= PREVIEW_OVERLAP_IOU
+                and _intersection_ratio(sb, tb) >= PREVIEW_MIN_SNOW_IN_TRUCK
+                and (
+                    _center_inside(sb, tb)
+                    or _intersection_ratio(sb, tb) >= 0.45
+                )
+                for t in trucks
+                for tb in [t.get("bbox")]
+                if tb
+            ):
+                valid_snow.append(s)
+
+        truck_count = 0
+        snow_count = 0
+        for det in trucks:
+            bbox = det.get('bbox')
             if bbox:
-                # Рисуем динамический квадрат вокруг всего грузовика (зелёный)
-                sx1, sy1, sx2, sy2 = _make_dynamic_square(bbox, w, h)
-                cv2.rectangle(out, (sx1, sy1), (sx2, sy2), (0, 255, 0), 3)
-                
-                # Для грузовиков дополнительно выделяем кузов (синий квадрат)
-                if class_id == TRUCK_CLASS_ID:
-                    cargo_bbox = _estimate_cargo_bbox(bbox, class_id)
-                    if cargo_bbox:
-                        # Рисуем динамический квадрат вокруг кузова (синий, тонкая линия)
-                        csx1, csy1, csx2, csy2 = _make_dynamic_square(cargo_bbox, w, h)
-                        cv2.rectangle(out, (csx1, csy1), (csx2, csy2), (255, 0, 0), 2)
+                truck_count += 1
+                x1, y1, x2, y2 = bbox
+                cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(out, "truck", (x1, max(16, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+        for det in valid_snow:
+            bbox = det.get("bbox")
+            if bbox:
+                snow_count += 1
+                x1, y1, x2, y2 = bbox
+                cv2.rectangle(out, (x1, y1), (x2, y2), (255, 255, 0), 2)
+                cv2.putText(out, "snow", (x1, max(16, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+
+        if trucks or snows:
+            cv2.putText(
+                out,
+                f"YOLO: trucks={truck_count} snow_in_truck={snow_count}/{len(snows)}",
+                (10, 54),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (180, 255, 180),
+                2,
+            )
     
     # Рисуем линию
     cv2.line(out, (x1_px, y1_px), (x2_px, y2_px), (0, 255, 255), 2, lineType=cv2.LINE_AA)
